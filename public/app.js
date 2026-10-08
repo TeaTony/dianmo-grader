@@ -314,6 +314,23 @@ function renderStatus() {
   }
 }
 
+/* 批次的展示班级：服务端 /api/state 已算好 displayClass（批次没填班级时
+   取这批作文里最多的班级写法）；拿不到 displayClass 的旧对象（如 /api/batch/get
+   返回的完整批次）就在本地从 essays 里现算一遍 */
+function batchDisplayClass(b) {
+  if (b.displayClass) return b.displayClass;
+  if (String(b.className || '').trim()) return b.className;
+  const vote = {};
+  let best = '', bestN = 0;
+  (b.essays || []).forEach(function (e) {
+    const cls = String(((e.identity || {}).className) || '').trim();
+    if (!cls) return;
+    vote[cls] = (vote[cls] || 0) + 1;
+    if (vote[cls] > bestN) { bestN = vote[cls]; best = cls; }
+  });
+  return best;
+}
+
 function renderBatchSelect() {
   const sel = document.getElementById('batchSelect');
   if (!S.batches.length) {
@@ -321,7 +338,8 @@ function renderBatchSelect() {
     return;
   }
   sel.innerHTML = S.batches.map(function (b) {
-    return '<option value="' + b.id + '">' + esc(b.title) + (b.className ? ' · ' + esc(b.className) : '') +
+    const cls = batchDisplayClass(b);
+    return '<option value="' + b.id + '">' + esc(b.title) + (cls ? ' · ' + esc(cls) : '') +
       '（' + b.done + '/' + b.count + '）</option>';
   }).join('');
   if (S.current) sel.value = S.current.id;
@@ -366,6 +384,8 @@ function openBatchForm(mode) {
     document.getElementById('nbCardSub').textContent = '改题目 / 默认班级 / 要点都不会影响已批改的结果';
     document.getElementById('nbTitle').value = S.current.title || '';
     document.getElementById('nbClass').value = S.current.className || '';
+    document.getElementById('nbWord').value = S.current.wordLimit || '';
+    document.getElementById('nbFormat').value = S.current.format || '';
     renderPoints(S.current.points && S.current.points.length ? S.current.points : ['']);
     document.getElementById('btnCreateBatch').textContent = '保存修改';
   } else {
@@ -375,6 +395,8 @@ function openBatchForm(mode) {
     document.getElementById('nbCardSub').textContent = '题目与要点越准确，漏点判定越准';
     document.getElementById('nbTitle').value = '';
     document.getElementById('nbClass').value = '';
+    document.getElementById('nbWord').value = '';
+    document.getElementById('nbFormat').value = '';
     renderPoints(['']);
     document.getElementById('btnCreateBatch').textContent = '创建批次';
   }
@@ -440,11 +462,13 @@ document.getElementById('btnCreateBatch').addEventListener('click', async functi
   if (!title) { alert('请先填写作文题目'); return; }
   const points = collectPoints();
   const className = document.getElementById('nbClass').value.trim();
+  const wordLimit = document.getElementById('nbWord').value.trim();
+  const format = document.getElementById('nbFormat').value.trim();
 
   // 修改已有批次
   if (S.batchEditId) {
     const r0 = await api('/api/batch/update', {
-      id: S.batchEditId, title: title, className: className, points: points
+      id: S.batchEditId, title: title, className: className, points: points, wordLimit: wordLimit, format: format
     });
     if (!r0.ok) { alert('保存失败：' + r0.error); return; }
     closeBatchForm();
@@ -453,7 +477,7 @@ document.getElementById('btnCreateBatch').addEventListener('click', async functi
     return;
   }
 
-  const r = await api('/api/batch/create', { title: title, className: className, points: points });
+  const r = await api('/api/batch/create', { title: title, className: className, points: points, wordLimit: wordLimit, format: format });
   if (!r.ok) { alert('创建失败：' + r.error); return; }
   document.getElementById('nbTitle').value = '';
   document.getElementById('nbClass').value = '';
@@ -562,6 +586,8 @@ async function handleQuestionPhoto(file) {
 
   const q = r.question || {};
   if (q.title) document.getElementById('nbTitle').value = q.title;
+  if (q.wordLimit) document.getElementById('nbWord').value = q.wordLimit;
+  if (q.format) document.getElementById('nbFormat').value = q.format;
   const pts = q.points || [];
   renderPoints(pts.length ? pts : ['']);
 
@@ -773,12 +799,29 @@ document.getElementById('btnGrade').addEventListener('click', async function () 
   if (aborted) alert('当前批次已被删除，剩余照片没有继续批改。');
 
   document.getElementById('progBar').style.width = '100%';
-  pt.innerHTML = '<span>完成：成功 ' + okCount + ' 篇' + (failCount ? '，失败 ' + failCount + ' 篇' : '') + '</span><span>100%</span>';
+  renderWorkbench();
+  await refreshSummaries();
+
+  // 设置里开了「批改完成后自动生成范文」：接着把刚批好的这些篇的范文补上。
+  // 范文是单独一次请求，失败只影响范文，不会连累已经落库的批改结果。
+  // S.grading 一直保持到这一步结束，避免这段时间里再点一次「开始批改」把两段循环叠在一起。
+  let essayNote = '';
+  if (!aborted && okCount > 0 && S.settings.modelEssay && S.current && S.current.id === batchId) {
+    const need = S.current.essays.filter(hasResult).filter(noEssay);
+    if (need.length) {
+      const er = await makeEssaysFor(need);
+      essayNote = '；范文成功 ' + er.okN + ' 篇' + (er.badN ? '，失败 ' + er.badN + ' 篇（可点「生成范文」重试）' : '');
+      await refreshCurrent();
+      renderEssays();
+      renderWorkbench();
+    }
+  }
+
+  pt.innerHTML = '<span>完成：成功 ' + okCount + ' 篇' + (failCount ? '，失败 ' + failCount + ' 篇' : '') + essayNote + '</span><span>100%</span>';
 
   S.grading = false;
   renderQueue();
   renderWorkbench();
-  await refreshSummaries();
   setTimeout(function () { pw.style.display = 'none'; pt.style.display = 'none'; }, 4000);
 });
 
@@ -832,6 +875,35 @@ function essayCounts(b) {
   return { valid: valid.length, missing: valid.filter(noEssay).length, need: valid.filter(noEssay) };
 }
 
+/* 逐篇生成范文。批次页「生成范文」按钮和「批改完成后自动生成范文」共用这一段。
+   返回 { okN, badN, aborted }；aborted 表示批次已被删除，不再继续往后跑。 */
+async function makeEssaysFor(list) {
+  const pw = document.getElementById('progWrap'), pt = document.getElementById('progTxt');
+  pw.style.display = 'block'; pt.style.display = 'flex';
+  let okN = 0, badN = 0, aborted = false;
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    const pct = Math.round((i / list.length) * 100);
+    document.getElementById('progBar').style.width = pct + '%';
+    pt.innerHTML = '<span>正在为第 ' + item.no + ' 号写范文（' + (i + 1) + ' / ' + list.length + '）</span><span>' + pct + '%</span>';
+    const res = await api('/api/essay/model', { batchId: S.current.id, essayId: item.id });
+    if (res.ok && res.essay) {
+      const idx = S.current.essays.findIndex((x) => x.id === item.id);
+      if (idx > -1) S.current.essays[idx] = res.essay;
+      okN++;
+    } else {
+      if (/批次不存在|已被删除/.test(res.error || '')) {
+        aborted = true;
+        break;
+      }
+      badN++;
+    }
+    renderEssays();
+  }
+  document.getElementById('progBar').style.width = '100%';
+  return { okN: okN, badN: badN, aborted: aborted };
+}
+
 document.getElementById('btnMakeEssays').addEventListener('click', async function () {
   const b = S.current;
   if (!b) { alert('请先选择批次'); return; }
@@ -842,38 +914,16 @@ document.getElementById('btnMakeEssays').addEventListener('click', async functio
   if (!confirm('将为 ' + c.missing + ' 篇作文生成「适配学生水平」的范文。\n\n' +
     '每篇约需十几秒，按输出字数计费。生成后可在每篇详情里查看和修改，也可直接导出学生报告。\n\n是否继续？')) return;
 
-  const list = c.need.slice();
-  const pw = document.getElementById('progWrap'), pt = document.getElementById('progTxt');
-  pw.style.display = 'block'; pt.style.display = 'flex';
   this.disabled = true;
-
-  let okN = 0, badN = 0;
-  for (let i = 0; i < list.length; i++) {
-    const item = list[i];
-    const pct = Math.round((i / list.length) * 100);
-    document.getElementById('progBar').style.width = pct + '%';
-    pt.innerHTML = '<span>正在为第 ' + item.no + ' 号写范文（' + (i + 1) + ' / ' + list.length + '）</span><span>' + pct + '%</span>';
-    const res = await api('/api/essay/model', { batchId: b.id, essayId: item.id });
-    if (res.ok && res.essay) {
-      const idx = S.current.essays.findIndex((x) => x.id === item.id);
-      if (idx > -1) S.current.essays[idx] = res.essay;
-      okN++;
-    } else {
-      if (/批次不存在|已被删除/.test(res.error || '')) {
-        alert('当前批次已被删除，剩余范文没有继续生成。');
-        break;
-      }
-      badN++;
-    }
-    renderEssays();
-  }
-
-  document.getElementById('progBar').style.width = '100%';
-  pt.innerHTML = '<span>范文生成完成：成功 ' + okN + ' 篇' + (badN ? '，失败 ' + badN + ' 篇' : '') + '</span><span>100%</span>';
+  const r = await makeEssaysFor(c.need.slice());
+  if (r.aborted) alert('当前批次已被删除，剩余范文没有继续生成。');
+  document.getElementById('progTxt').innerHTML =
+    '<span>范文生成完成：成功 ' + r.okN + ' 篇' + (r.badN ? '，失败 ' + r.badN + ' 篇' : '') + '</span><span>100%</span>';
   this.disabled = false;
   await refreshCurrent();
   renderWorkbench();
-  if (badN) alert(badN + ' 篇范文生成失败，可再点一次重试。');
+  if (r.badN) alert(r.badN + ' 篇范文生成失败，可再点一次重试。');
+  const pw = document.getElementById('progWrap'), pt = document.getElementById('progTxt');
   setTimeout(function () { pw.style.display = 'none'; pt.style.display = 'none'; }, 5000);
 });
 
@@ -946,11 +996,24 @@ document.getElementById('btnRegrade').addEventListener('click', async function (
   }
 
   document.getElementById('progBar').style.width = '100%';
-  pt.innerHTML = '<span>重批完成：成功 ' + okN + ' 篇' + (badN ? '，仍未成功 ' + badN + ' 篇' : '') + '</span><span>100%</span>';
   this.disabled = false;
   await refreshCurrent();
   renderWorkbench();
   await refreshSummaries();
+
+  // 与「开始批改」一致：开了自动生成范文时，把刚重批成功、还没有范文的补上
+  let essayNote = '';
+  if (okN > 0 && S.settings.modelEssay && S.current && S.current.id === b.id) {
+    const need = S.current.essays.filter(hasResult).filter(noEssay);
+    if (need.length) {
+      const er = await makeEssaysFor(need);
+      essayNote = '；范文成功 ' + er.okN + ' 篇' + (er.badN ? '，失败 ' + er.badN + ' 篇' : '');
+      await refreshCurrent();
+      renderEssays();
+    }
+  }
+
+  pt.innerHTML = '<span>重批完成：成功 ' + okN + ' 篇' + (badN ? '，仍未成功 ' + badN + ' 篇' : '') + essayNote + '</span><span>100%</span>';
   setTimeout(function () { pw.style.display = 'none'; pt.style.display = 'none'; }, 5000);
 });
 
@@ -1026,6 +1089,7 @@ function essayCard(e) {
       }
       body += errorsBlock(e.ai && e.ai.errors);
       body += plagiarismBlock(e.ai && e.ai.plagiarism);
+      body += teacherNoteBlock(r.teacherNote);
       if (r.deductions && r.deductions.length) {
         body += '<div class="blk warn"><h5>硬性扣分</h5><ul>' +
           r.deductions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
@@ -1115,6 +1179,13 @@ function plagiarismBlock(pl) {
   h += '</div>';
   if (!copied) h += '<div class="hint">AI 不能百分百确定，请点开原图人工核对后，再决定是否按抄袭处理。</div>';
   return h + '</div>';
+}
+
+/* 教师备注：仅供教师内部看（如"辨认不清请复核""疑似抄袭待人工判断"），不进学生报告 */
+function teacherNoteBlock(tn) {
+  const t = String(tn || '').trim();
+  if (!t) return '';
+  return '<div class="blk warn"><h5>教师备注（仅内部，不进学生报告）</h5><div class="ta">' + esc(t) + '</div></div>';
 }
 
 /* 来源标签：让老师一眼看出这个姓名是从哪儿来的 */
@@ -1217,6 +1288,8 @@ function reviewForm(e, r) {
     '<textarea id="rv-sg-' + e.id + '">' + esc((r.suggestions || []).join('\n')) + '</textarea></div>' +
     '<div class="field"><label class="lb">综合评语</label>' +
     '<textarea id="rv-cm-' + e.id + '">' + esc(r.comment || '') + '</textarea></div>' +
+    '<div class="field"><label class="lb">教师备注 <small>仅内部，不进学生报告</small></label>' +
+    '<textarea id="rv-tn-' + e.id + '">' + esc(r.teacherNote || '') + '</textarea></div>' +
     '<div class="field"><label class="lb">适配水平优化范文 <small>可编辑；留空时报告用「生成范文」的结果（如有）</small></label>' +
     '<textarea id="rv-me-' + e.id + '">' + esc(modelEssayOf(e) || '') + '</textarea></div>';
 }
@@ -1269,6 +1342,7 @@ document.getElementById('essayList').addEventListener('click', async function (e
       problems: splitLines(g('rv-p').value),
       suggestions: splitLines(g('rv-sg').value),
       comment: g('rv-cm').value.trim(),
+      teacherNote: g('rv-tn').value.trim(),
       modelEssay: g('rv-me') ? g('rv-me').value.trim() : modelEssayOf(e),
       pointsDetail: (e.ai && e.ai.pointsDetail) || [],
       transcription: (e.ai && e.ai.transcription) || '',
@@ -1421,7 +1495,7 @@ function renderBatchList() {
   box.innerHTML = S.batches.map(function (b) {
     return '<div class="batchrow' + (S.recordBatch === b.id ? ' on' : '') + '" data-bid="' + b.id + '">' +
       '<div class="info"><b>' + esc(b.title) + '</b>' +
-      '<span>' + fmtDate(b.createdAt) + (b.className ? '　·　' + esc(b.className) : '') + '</span></div>' +
+      '<span>' + fmtDate(b.createdAt) + (batchDisplayClass(b) ? '　·　' + esc(batchDisplayClass(b)) : '') + '</span></div>' +
       '<span class="pill">已批改 ' + b.done + ' / ' + b.count + '</span>' +
       '</div>';
   }).join('');
@@ -1457,7 +1531,7 @@ async function renderRecords() {
   const rev = b.essays.filter((e) => e.reviewed).length;
 
   document.getElementById('statCard').style.display = 'block';
-  document.getElementById('statSub').textContent = b.title + (b.className ? ' · ' + b.className : '');
+  document.getElementById('statSub').textContent = b.title + (batchDisplayClass(b) ? ' · ' + batchDisplayClass(b) : '');
   document.getElementById('stats').innerHTML =
     statBox('已批改', scored.length, '/ ' + b.essays.length + ' 篇') +
     statBox('班级平均', nums.length ? avg.toFixed(1) : '—', '/ 25') +
@@ -2188,6 +2262,7 @@ function openRecDetail(rec) {
   }
   h += errorsBlock(rec.errors);
   h += plagiarismBlock(rec.plagiarism);
+  h += teacherNoteBlock(rec.teacherNote);
   if (rec.deductions && rec.deductions.length) {
     h += '<div class="blk warn"><h5>硬性扣分</h5><ul>' +
       rec.deductions.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>';
@@ -2266,7 +2341,9 @@ document.getElementById('stuDetail').addEventListener('click', async function (e
   btn.disabled = false;
   if (!r.ok) { alert('保存失败：' + r.error); return; }
   await renderArchive();
-  renderStudentDetail(btn.dataset.sid);
+  // 保存可能触发同名同班合并，被编辑的这条 id 会被并入另一条后消失；
+  // 用服务端返回的存活 id 重开详情，否则会报「学生档案不存在」。
+  renderStudentDetail(r.id || btn.dataset.sid);
 });
 
 document.getElementById('btnArchiveCsv').addEventListener('click', function () {

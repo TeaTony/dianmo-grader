@@ -84,6 +84,14 @@
         <div class="hint">一个批次里混了几个班的卷子也没关系：每篇按卷面上写的班级记，这里只是「一键填写班级」时的默认值。</div>
       </div>
       <div class="field">
+        <label class="lb">词数要求 <small>选填，拍照识别会自动填入</small></label>
+        <input type="text" id="nbWord" placeholder="如 100 词左右">
+      </div>
+      <div class="field">
+        <label class="lb">文体 <small>选填，如 记叙文 / 发言稿 / 书信</small></label>
+        <input type="text" id="nbFormat" placeholder="如 记叙文 / 书信">
+      </div>
+      <div class="field">
         <label class="lb">本题核心要点 <small>数量不固定，有几条填几条</small></label>
         <div id="nbPoints"></div>
         <button class="btn sm ghost" id="btnAddPoint" type="button">＋ 加一条要点</button>
@@ -231,8 +239,8 @@
       </div>
 
       <div class="field">
-        <label class="chk"><input type="checkbox" id="sModelEssay"><span>让 AI 同时生成「适配水平优化范文」</span></label>
-        <div class="hint">开启后每篇会多输出一段约 100 词的范文，批改变慢、费用增加，按篇计。批量阅卷建议关闭；需要给学生做示范或写讲评时再开。</div>
+        <label class="chk"><input type="checkbox" id="sModelEssay"><span>批改完成后自动生成「适配水平优化范文」</span></label>
+        <div class="hint">开启后，每篇批改完成会紧接着再调一次接口写范文，耗时和费用都会增加，按篇计。范文是<b>单独一次请求</b>生成的，所以写范文失败不会影响批改结果；它依据该篇的批改结果改写，学生报告里的「为什么这样改」「好词好句」也会一并生成。批量阅卷建议关闭，需要出学生报告时再开——批次页的「生成范文」按钮任何时候都能手动补。</div>
       </div>
       <div class="btn-row">
         <button class="btn" id="btnSaveSettings">保存配置</button>
