@@ -14,7 +14,9 @@ const { exec } = require('child_process');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
+/* 数据目录：默认在程序旁边；打包成 App 后由启动器用 DIANMO_DATA_DIR 指到
+   「文稿/点墨数据」，程序本体升级替换不会动到数据。 */
+const DATA_DIR = process.env.DIANMO_DATA_DIR || path.join(ROOT, 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const STUDENTS_FILE = path.join(DATA_DIR, 'students.json');
