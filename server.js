@@ -682,7 +682,8 @@ async function rebuildStudents() {
     });
   });
 
-  // 丢弃已经没有作文的残留档案
+  // 丢弃已经没有作文的残留档案 —— 教师批量建立的档案（manual，还没交作文）不算残留，保留
+  store.students.forEach(function (s) { if (s.manual) used[s.id] = true; });
   const list = Object.keys(byKey).map(function (k) { return byKey[k]; })
     .filter(function (s) { return used[s.id]; });
   list.sort(function (a, b2) {
@@ -2799,30 +2800,74 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 删除学生档案：作文与成绩保留，但解除关联并清掉这些作文上的姓名 ----
      （登分表里变回空白，可重新填写或识别）。不跑 rebuildStudents ——
-     残留姓名会被它重新建档，删除就白删了。 */
+     残留姓名会被它重新建档，删除就白删了。
+     支持批量：传 ids 数组一次删多个；传单个 id 也照旧可用。 */
   if (pathname === '/api/student/delete') {
     return await withData(async function () {
       const store = await loadStudents();
-      const s = store.students.find(function (x) { return x.id === body.id; });
-      if (!s) return sendJson(res, 404, { ok: false, error: '学生档案不存在' });
+      const ids = (Array.isArray(body.ids) ? body.ids : [body.id]).map(String).filter(Boolean);
+      if (!ids.length) return sendJson(res, 200, { ok: false, error: '没有指定要删除的学生' });
+      const set = new Set(ids);
       const db = await loadDb();
-      let updated = 0;
+      let unlinked = 0, deleted = 0;
+      const names = [];
       db.batches.forEach(function (b) {
         b.essays.forEach(function (e) {
-          if (e.studentId !== s.id) return;
+          if (!e.studentId || !set.has(String(e.studentId))) return;
           e.studentId = '';
           e.nameCandidates = [];
           const idt = e.identity || {};
           if (String(idt.name || '').trim()) {
             e.identity = Object.assign({}, idt, { name: '', updatedAt: new Date().toISOString() });
           }
-          updated++;
+          unlinked++;
         });
       });
-      store.students = store.students.filter(function (x) { return x.id !== s.id; });
+      store.students = store.students.filter(function (x) {
+        if (!set.has(x.id)) return true;
+        names.push(x.name);
+        deleted++;
+        return false;
+      });
+      if (!deleted) return sendJson(res, 404, { ok: false, error: '学生档案不存在' });
       await writeJson(DB_FILE, db);
       await writeJson(STUDENTS_FILE, store);
-      return sendJson(res, 200, { ok: true, updated: updated, name: s.name });
+      return sendJson(res, 200, { ok: true, deleted: deleted, unlinked: unlinked, names: names });
+    });
+  }
+
+  /* ---- 批量建立学生档案：还没批改到作文的学生先建档（如开学初录全班名单） ----
+     文本格式与班级名单一致：每行一个，支持「24 李小明」「李小明 24」「李小明」。
+     manual 标记让这些零作文档案不会被 rebuildStudents 当残留清掉；
+     之后批改到他们的作文时，按「班级＋姓名」自动并入同一条档案。
+     已存在的同名同班学生只补空着的学号，不重复建档。 */
+  if (pathname === '/api/student/batch-create') {
+    return await withData(async function () {
+      const store = await loadStudents();
+      const className = String(body.className || '').trim();
+      const items = parseRosterText(body.text || '');
+      if (!items.length) {
+        return sendJson(res, 200, { ok: false, error: '没有解析出任何学生。每行一个，可写「姓名」「学号 姓名」或「姓名 学号」。' });
+      }
+      const now = new Date().toISOString();
+      let added = 0, merged = 0;
+      items.forEach(function (it) {
+        const key = studentKey(className, it.name);
+        const hit = key ? store.students.find(function (s) { return s.key === key; }) : null;
+        if (hit) {
+          if (!hit.seatNo && it.seatNo) hit.seatNo = it.seatNo;
+          hit.updatedAt = now;
+          merged++;
+          return;
+        }
+        store.students.push({
+          id: uid('s_'), key: key, name: it.name, className: className, seatNo: it.seatNo,
+          manual: true, createdAt: now, updatedAt: now
+        });
+        added++;
+      });
+      await writeJson(STUDENTS_FILE, store);
+      return sendJson(res, 200, { ok: true, added: added, merged: merged, total: items.length });
     });
   }
 
