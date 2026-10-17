@@ -2758,8 +2758,9 @@ async function handleApi(req, res, pathname, query) {
   }
 
   /* ---- 一键填写班级：把班级名批量填到这一批的作文上 ----
-     一个批次里混了几个班的卷子时用得上。只填空白的，不会动已经认出来的班级；
-     选「全部改成」才会覆盖。重新批改时若卷面上识别到班级，仍会以识别结果为准。 */
+     勾选模式（mode = 'selected' + essayIds）只填勾中的篇目，已有班级也覆盖 ——
+     勾哪些是教师在登分表里明确选好的，不需要再像 all 模式那样 confirm。
+     旧模式保留兼容：blank = 只填空白，all = 全部覆盖。 */
   if (pathname === '/api/class/fill') {
     return await withData(async function () {
       const db = await loadDb();
@@ -2768,12 +2769,19 @@ async function handleApi(req, res, pathname, query) {
       const cls = String(body.className || '').trim();
       if (!cls) return sendJson(res, 200, { ok: false, error: '请先填写班级名称' });
       const all = body.mode === 'all';
+      const selected = all ? null
+        : (body.mode === 'selected' ? new Set((Array.isArray(body.essayIds) ? body.essayIds : []).map(String)) : null);
+      if (body.mode === 'selected' && !selected.size) {
+        return sendJson(res, 200, { ok: false, error: '还没有勾选任何一篇作文' });
+      }
       let filled = 0;
       b.essays.forEach(function (e) {
         const idt = e.identity || {};
         const has = String(idt.className || '').trim();
-        if (!all && has) return;                       // 只填空白：班级还空着的都要填，
-                                                        // 不看姓名是手填的还是认出来的
+        if (selected ? !selected.has(String(e.id)) : (!all && has)) {
+          return;                                           // 只填空白：班级还空着的都要填，
+                                                           // 不看姓名是手填的还是认出来的
+        }
         if (has === cls) return;
         e.identity = Object.assign({}, idt, {
           className: cls,
@@ -2786,6 +2794,35 @@ async function handleApi(req, res, pathname, query) {
         await rebuildStudents();       // 班级变了，学生档案的归并键跟着变
       }
       return sendJson(res, 200, { ok: true, filled: filled });
+    });
+  }
+
+  /* ---- 删除学生档案：作文与成绩保留，但解除关联并清掉这些作文上的姓名 ----
+     （登分表里变回空白，可重新填写或识别）。不跑 rebuildStudents ——
+     残留姓名会被它重新建档，删除就白删了。 */
+  if (pathname === '/api/student/delete') {
+    return await withData(async function () {
+      const store = await loadStudents();
+      const s = store.students.find(function (x) { return x.id === body.id; });
+      if (!s) return sendJson(res, 404, { ok: false, error: '学生档案不存在' });
+      const db = await loadDb();
+      let updated = 0;
+      db.batches.forEach(function (b) {
+        b.essays.forEach(function (e) {
+          if (e.studentId !== s.id) return;
+          e.studentId = '';
+          e.nameCandidates = [];
+          const idt = e.identity || {};
+          if (String(idt.name || '').trim()) {
+            e.identity = Object.assign({}, idt, { name: '', updatedAt: new Date().toISOString() });
+          }
+          updated++;
+        });
+      });
+      store.students = store.students.filter(function (x) { return x.id !== s.id; });
+      await writeJson(DB_FILE, db);
+      await writeJson(STUDENTS_FILE, store);
+      return sendJson(res, 200, { ok: true, updated: updated, name: s.name });
     });
   }
 
