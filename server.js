@@ -3461,16 +3461,31 @@ async function handleApi(req, res, pathname, query) {
     const cls = {};
     students.forEach(function (s) {
       const k = s.className;
-      if (!cls[k]) cls[k] = { className: k, students: 0, essays: 0, scores: [], unnamed: 0 };
+      if (!cls[k]) cls[k] = { className: k, students: 0, essays: 0, scores: [], unnamed: 0, unnamedEssays: [] };
       cls[k].students++;
       cls[k].essays += s.records.length;
       s.records.forEach(function (r) { if (r.score !== null) cls[k].scores.push(r.score); });
     });
     db.batches.forEach(function (b) {
       const k = displayOf(b.className);
-      if (!cls[k]) cls[k] = { className: k, students: 0, essays: 0, scores: [], unnamed: 0 };
+      if (!cls[k]) cls[k] = { className: k, students: 0, essays: 0, scores: [], unnamed: 0, unnamedEssays: [] };
       b.essays.forEach(function (e) {
-        if (!(e.identity || {}).name) cls[k].unnamed++;
+        if (!(e.identity || {}).name) {
+          cls[k].unnamed++;
+          // 未归名作文明细：教师能在学生档案里看到这些「游离」作文，并据此补姓名归入档案
+          const ur = hasResult(e) ? eff(e) : null;
+          const uidt = e.identity || {};
+          const uidf = e.identifier || {};
+          cls[k].unnamedEssays.push({
+            essayId: e.id, batchId: b.id, batchTitle: b.title, no: e.no,
+            className: uidt.className || '', seatNo: uidt.seatNo || '',
+            title: uidf.title || '', firstSentence: uidf.firstSentence || '',
+            file: e.file || '',
+            score: ur && ur.score !== undefined ? ur.score : null,
+            tier: (ur && ur.tier) || '',
+            reviewed: !!e.reviewed, status: e.status || ''
+          });
+        }
       });
     });
     // 花名册里已建、还没有学生的班级（比如刚「添加班级」的空班）也进班级概览
@@ -3479,7 +3494,7 @@ async function handleApi(req, res, pathname, query) {
       const nm = String(c.className || '').trim();
       if (!nm) return;
       const disp = displayOf(nm);
-      if (!cls[disp]) cls[disp] = { className: disp, students: 0, essays: 0, scores: [], unnamed: 0 };
+      if (!cls[disp]) cls[disp] = { className: disp, students: 0, essays: 0, scores: [], unnamed: 0, unnamedEssays: [] };
     });
     const classes = Object.keys(cls).map(function (k) {
       const c = cls[k];
@@ -3488,6 +3503,7 @@ async function handleApi(req, res, pathname, query) {
         students: c.students,
         essays: c.essays,
         unnamed: c.unnamed,
+        unnamedEssays: c.unnamedEssays || [],
         avg: c.scores.length ? Math.round((c.scores.reduce(function (a, x) { return a + x; }, 0) / c.scores.length) * 10) / 10 : null
       };
     });
