@@ -347,6 +347,15 @@ const IDENTITY_PROMPT = `你要从一张初三英语作文卷面的照片里，�
   "found": true 或 false（是否在卷面上找到了学生自己写的身份信息）
 }`;
 
+/* 识别请求里附带名单的说明（readEssayIdentity 会把教师已有的班级名单附进 user 消息） */
+const IDENTITY_ROSTER_NOTE = `【名单参考】
+本条消息可能附带教师提供的班级名单（班级名单 + 学生档案），用来辅助辨认潦草的手写姓名：
+- 手写字与名单里的某个名字对得上时，优先把名单里的写法填进 name 或 candidates；
+- 对不上就以卷面为准，绝不要为了「凑一个名单里的名字」而改认；
+- 名单只是参考材料，不是卷面上写的内容，不得把名单直接当成识别结果。`;
+
+
+
 /* 为学生单独生成「适配水平优化范文」（用于打印后发给学生的报告） */
 const ESSAY_PROMPT = `你是拥有 15 年苏州高新区初三英语教学及中考阅卷经验的资深教师。现在你要为一名初三学生改写一篇「适配他现有水平」的优化范文，用于学生对照学习、课后背诵模仿。
 
@@ -383,6 +392,25 @@ const CLASS_PROMPT = `你是拥有 15 年苏州高新区初三英语教学及中
   "commonProblems": ["全班共性问题，2–4 条，每条都要点出具体表现"],
   "guidance": ["下一阶段教学建议，3–5 条，可落地"]
 }`;
+
+/* 花名册文件导入（格式不固定，AI 按语义识别班级分组 / 姓名 / 学号） */
+const ROSTER_IMPORT_PROMPT = `你是协助初三英语教师整理学生花名册的助手。教师会上传一份花名册文件（Excel / CSV 提取出的纯文本），格式不固定：可能是「学号 姓名」两列，可能带表头（如「班级 姓名 学号 性别」），可能一个文件里有好几个班（分 sheet 或分段），也可能混着成绩、备注等无关列。你要从中识别出班级分组和每个学生的姓名、学号/考号。
+
+【识别规则】
+1. 不设固定格式假设：按表头和内容语义判断哪列是姓名（2–4 个汉字）、哪列是学号/考号（数字）。学号列不明确或某行没有就留空字符串。
+2. 班级归属：从班级列、表头、sheet 名或分段标题推断（如「九(2)」「初三8班」，照原样保留写法）；整个文件只有一个班就归为一个组；实在看不出班级名的组，className 写「未命名班级」。
+3. 只收学生行：表头、合计行、备注、空行、明显不是学生姓名的内容（如「合计」「平均分」）一律丢弃。识别不出的行直接丢弃，绝不要编造学生。
+4. 同一个班内去重（同名同学号只留一条）。
+
+【输出要求】
+只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块包裹。字段如下：
+{
+  "groups": [
+    { "className": "九(2)", "students": [ { "seatNo": "24", "name": "李小明" } ] }
+  ]
+}`;
+
+
 
 /* ------------------------------------------------------------------ */
 /* 基础工具                                                            */
@@ -936,7 +964,7 @@ function normalizeIdentity(d) {
 
 /* 拿名单核对识别结果，返回 { name, className, seatNo, matchedBy, rosterName, candidates, note }
    matchedBy: seat = 考号命中（最可靠）；name = 姓名与名单高度相似；conflict = 考号与姓名互相矛盾，请老师点 */
-function reconcileWithRoster(store, className, read) {
+function reconcileWithRoster(store, className, read, archiveStudents) {
   const seat = digitsOf(read.seatNo);
   const name = String(read.name || '').trim();
   const res = {
@@ -1006,6 +1034,18 @@ function reconcileWithRoster(store, className, read) {
     res.note = '还没有「' + (res.className || className || '这个班') + '」的名单，识别结果没有名单可核对';
   }
 
+  // 学生档案里同班的学生也参与推荐：没有班级名单时，档案是唯一可参照的已知信息
+  if (name && Array.isArray(archiveStudents)) {
+    const ak = classKey(res.className || className);
+    archiveStudents
+      .filter(function (s) { return s.name && ak && classKey(s.className) === ak; })
+      .map(function (s) { return { s: s, sc: nameSimilarity(s.name, name) }; })
+      .filter(function (x) { return x.sc >= 0.32; })
+      .sort(function (a, b) { return b.sc - a.sc; })
+      .slice(0, 3)
+      .forEach(function (x) { pushCand(x.s.name, x.s.seatNo, 'archive', Math.round(x.sc * 100) / 100); });
+  }
+
   (read.candidates || []).forEach(function (c) { pushCand(c, '', 'ai', 0); });
   res.candidates = res.candidates.slice(0, 4);
   return res;
@@ -1054,8 +1094,35 @@ async function readEssayIdentity(settings, batch, essay) {
   await add(essay.file, essay.mime);
   if (!images.length) return { ok: false, error: '找不到这一篇的作文照片，无法识别姓名' };
 
-  const r = await askWithImages(settings, IDENTITY_PROMPT,
-    '请识别图片上学生自己写的身份信息（姓名 / 班级 / 考号），只返回 JSON。',
+  // 教师已有的本班名单（班级名单 + 学生档案）附进请求，辅助模型辨认潦草手写。
+  // 只作参考：模型对得上名单就用名单写法，对不上仍以卷面为准（见 IDENTITY_ROSTER_NOTE）。
+  const rstore = await loadRosters();
+  const sstore = await loadStudents();
+  const cur0 = essay.identity || {};
+  const clsName = String(cur0.className || (batch && batch.className) || '').trim();
+  const seenName = {};
+  const lines = [];
+  const addName = function (n, seat) {
+    n = String(n || '').trim();
+    if (!n || seenName[n]) return;
+    seenName[n] = 1;
+    lines.push((seat ? seat + ' ' : '') + n);
+  };
+  if (clsName) {
+    const rc = rosterOf(rstore, clsName);
+    if (rc) rc.students.forEach(function (s) { addName(s.name, s.seatNo); });
+    sstore.students.forEach(function (s) {
+      if (classKey(s.className) === classKey(clsName)) addName(s.name, s.seatNo);
+    });
+  }
+  let userText = '请识别图片上学生自己写的身份信息（姓名 / 班级 / 考号），只返回 JSON。';
+  const sysPrompt = lines.length ? IDENTITY_PROMPT + '\n\n' + IDENTITY_ROSTER_NOTE : IDENTITY_PROMPT;
+  if (lines.length) {
+    userText += '\n\n教师提供的本班名单（按「学号 姓名」排，仅供辅助辨认）：\n' + lines.slice(0, 120).join('\n');
+  }
+
+  const r = await askWithImages(settings, sysPrompt,
+    userText,
     images,
     function (d) {
       return !!(d && typeof d === 'object' &&
@@ -1065,9 +1132,8 @@ async function readEssayIdentity(settings, batch, essay) {
   if (!r.ok) return { ok: false, error: r.reason, raw: r.raw };
 
   const read = normalizeIdentity(r.data);
-  const store = await loadRosters();
   const cur = essay.identity || {};
-  const merged = reconcileWithRoster(store, read.className || cur.className || (batch && batch.className) || '', read);
+  const merged = reconcileWithRoster(rstore, read.className || cur.className || (batch && batch.className) || '', read, sstore.students);
   return { ok: true, read: read, merged: merged, hadShot: !!essay.identityShot };
 }
 
@@ -1833,6 +1899,131 @@ function buildDocx(bodyXml) {
     { name: '_rels/.rels', data: rels },
     { name: 'word/document.xml', data: doc }
   ]);
+}
+
+/* ---------------- 花名册文件读取：xlsx / csv（零依赖，读端与 zipSync 对应） ---------------- */
+
+/* 从 zip 里按条目名取出解压后的内容（xlsx 的容器就是 zip）。
+   读取路径：文件尾找 EOCD → 中央目录遍历 → 按本地头偏移取数据（0=stored / 8=deflate）。 */
+function unzipEntry(buf, wantName) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65536); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const zlib = require('zlib');
+  for (let n = 0; n < count && p + 46 <= buf.length; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) return null;
+    const method = buf.readUInt16LE(p + 10);
+    const compSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOff = buf.readUInt32LE(p + 42);
+    const name = buf.slice(p + 46, p + 46 + nameLen).toString('utf8');
+    if (name === wantName) {
+      const lNameLen = buf.readUInt16LE(localOff + 26);
+      const lExtraLen = buf.readUInt16LE(localOff + 28);
+      const start = localOff + 30 + lNameLen + lExtraLen;
+      const comp = buf.slice(start, start + compSize);
+      if (method === 0) return comp;
+      if (method === 8) return zlib.inflateRawSync(comp);
+      return null;
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
+}
+
+function unxml(s) {
+  return String(s || '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (m, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (m, d) => String.fromCodePoint(Number(d)));
+}
+
+/* 一个 sheet 的 XML → 制表符分隔的文本行 */
+function xlsxSheetToText(xml, shared) {
+  const rows = xml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
+  return rows.map(function (rowXml) {
+    const cells = {};
+    let maxCol = 0;
+    (rowXml.match(/<c [^>]*>[\s\S]*?<\/c>|<c [^>]*\/>/g) || []).forEach(function (cXml) {
+      const ref = /r="([A-Z]+)\d+"/.exec(cXml);
+      if (!ref) return;
+      let col = 0;
+      for (const ch of ref[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+      const t = /t="([^"]+)"/.exec(cXml);
+      let val = '';
+      const v = /<v>([\s\S]*?)<\/v>/.exec(cXml);
+      if (t && t[1] === 's') val = v ? (shared[Number(v[1])] || '') : '';
+      else if (t && t[1] === 'inlineStr') val = unxml((cXml.match(/<t[^>]*>([\s\S]*?)<\/t>/) || [])[1] || '');
+      else val = v ? unxml(v[1]) : '';
+      cells[col] = val;
+      if (col > maxCol) maxCol = col;
+    });
+    const arr = [];
+    for (let i = 1; i <= maxCol; i++) arr.push(cells[i] || '');
+    return arr.join('\t');
+  }).join('\n');
+}
+
+/* 花名册文件（xlsx / csv / txt）→ 纯文本。识别不了格式时抛 Error 说明原因。 */
+function rosterFileToText(name, buf) {
+  const ext = ((name.match(/\.([a-z0-9]+)$/i) || [])[1] || '').toLowerCase();
+  if (ext === 'xls') {
+    throw new Error('旧版 .xls 格式不支持，请用 Excel / WPS 打开后「另存为 .xlsx」再上传');
+  }
+  if (ext === 'csv' || ext === 'txt') {
+    let s = buf.toString('utf8');
+    if (s.indexOf('\uFFFD') !== -1) {
+      try { s = new TextDecoder('gbk').decode(buf); } catch (e) { /* 保留 utf8 结果 */ }
+    }
+    return s.replace(/^\uFEFF/, '');
+  }
+  if (buf.slice(0, 2).toString('latin1') !== 'PK') {
+    throw new Error('不是可识别的表格文件：请上传 .xlsx 或 .csv（旧版 .xls 请先另存为 .xlsx）');
+  }
+  // xlsx：sharedStrings + workbook 里的 sheet 顺序
+  const shared = [];
+  const ssBuf = unzipEntry(buf, 'xl/sharedStrings.xml');
+  if (ssBuf) {
+    ssBuf.toString('utf8').split(/<\/si>/).forEach(function (it) {
+      const ts = it.match(/<t[^>]*>[\s\S]*?<\/t>/g) || [];
+      shared.push(ts.map((t) => unxml(t.replace(/<[^>]+>/g, ''))).join(''));
+    });
+  }
+  const targets = [];
+  const relMap = {};
+  const rels = unzipEntry(buf, 'xl/_rels/workbook.xml.rels');
+  if (rels) {
+    (rels.toString('utf8').match(/<Relationship [^>]*>/g) || []).forEach(function (r) {
+      const id = /Id="([^"]+)"/.exec(r), t = /Target="([^"]+)"/.exec(r);
+      if (id && t) relMap[id[1]] = t[1].replace(/^\//, '').replace(/^(?!xl\/)/, 'xl/');
+    });
+  }
+  const wb = unzipEntry(buf, 'xl/workbook.xml');
+  if (wb) {
+    (wb.toString('utf8').match(/<sheet [^>]*\/?>/g) || []).forEach(function (s) {
+      const nm = /name="([^"]*)"/.exec(s), rid = /r:id="([^"]+)"/.exec(s) || /r:id="([^"]+)"/.exec(s.replace(/relationship:id=/i, 'r:id='));
+      if (nm && rid && relMap[rid[1]]) targets.push({ name: unxml(nm[1]), file: relMap[rid[1]] });
+    });
+  }
+  // workbook/rels 缺失或对不上时兜底：直接试 sheet1..sheet20
+  if (!targets.length) {
+    for (let i = 1; i <= 20; i++) targets.push({ name: '', file: 'xl/worksheets/sheet' + i + '.xml' });
+  }
+  const parts = [];
+  targets.forEach(function (t) {
+    const xml = unzipEntry(buf, t.file);
+    if (!xml) return;
+    const text = xlsxSheetToText(xml.toString('utf8'), shared).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (text) parts.push(t.name ? '—— ' + t.name + ' ——\n' + text : text);
+  });
+  if (!parts.length) throw new Error('文件里没有读到任何表格内容');
+  return parts.join('\n\n');
 }
 
 /* 单个学生一页的报告                                                        */
@@ -3001,12 +3192,179 @@ async function handleApi(req, res, pathname, query) {
       const students = parseRosterText(body.text);
       const key = classKey(className);
       const rest = store.classes.filter(function (c) { return classKey(c.className) !== key; });
-      if (students.length) {
-        rest.push({ className: className, students: students, updatedAt: new Date().toISOString() });
-      }
+      // 空文本 = 清空名单但保留班级（要删班走「删除班级」，那会连学生档案一起处理）
+      rest.push({ className: className, students: students, updatedAt: new Date().toISOString() });
       const next = { classes: rest };
       await writeJson(ROSTERS_FILE, next);
       return sendJson(res, 200, { ok: true, className: className, students: students, saved: students.length });
+    });
+  }
+
+  /* ---- 学生档案总览 ---- */
+  /* ---- 班级添加 / 删除 --------------------------------------------------
+     添加：先建一个空班（名单稍后贴，或用花名册导入），班级概览与班级下拉立刻能看到。
+     删除：连学生档案带名下作文（含照片）一起删，删前留 db 快照；带 expectedStudents
+     人数核对，防止确认弹窗之后数据又变了导致误删。 */
+  if (pathname === '/api/class/add') {
+    return await withData(async function () {
+      const className = String(body.className || '').trim();
+      if (!className) return sendJson(res, 200, { ok: false, error: '请先填写班级名称' });
+      const store = await loadRosters();
+      const k = classKey(className);
+      if (store.classes.some(function (c) { return classKey(c.className) === k; })) {
+        return sendJson(res, 200, { ok: true, existed: true });
+      }
+      store.classes.push({ className: className, students: [], updatedAt: new Date().toISOString() });
+      await writeJson(ROSTERS_FILE, store);
+      return sendJson(res, 200, { ok: true });
+    });
+  }
+
+  if (pathname === '/api/class/delete') {
+    return await withData(async function () {
+      const className = String(body.className || '').trim();
+      if (!className) return sendJson(res, 200, { ok: false, error: '请先指定班级' });
+      const k = classKey(className);
+      const store = await loadRosters();
+      const students = await loadStudents();
+      const targets = students.students.filter(function (s) { return classKey(s.className) === k; });
+      if (Number(body.expectedStudents) !== targets.length) {
+        return sendJson(res, 200, {
+          ok: false,
+          error: '该班学生人数与确认时对不上（当前 ' + targets.length + ' 名），请刷新后重试'
+        });
+      }
+      await safeSnapshot(DB_FILE, 'db', {});
+      const ids = new Set(targets.map(function (s) { return s.id; }));
+      const keys = new Set();
+      targets.forEach(function (s) {
+        const kk = studentKey(s.className, s.name);
+        if (kk) keys.add(kk);
+      });
+      const db = await loadDb();
+      let removedEssays = 0, cleanupFailed = 0;
+      for (const b of db.batches) {
+        const keep = [];
+        for (const e of b.essays) {
+          const idt = e.identity || {};
+          const ek = idt.name ? studentKey(idt.className, idt.name) : '';
+          const isHis = (e.studentId && ids.has(String(e.studentId))) || (ek && keys.has(ek));
+          if (isHis) { removedEssays++; cleanupFailed += await removeFiles([e]); continue; }
+          keep.push(e);
+        }
+        b.essays = keep;
+      }
+      students.students = students.students.filter(function (s) { return !ids.has(s.id); });
+      store.classes = store.classes.filter(function (c) { return classKey(c.className) !== k; });
+      await writeJson(DB_FILE, db);
+      await writeJson(STUDENTS_FILE, students);
+      await writeJson(ROSTERS_FILE, store);
+      return sendJson(res, 200, {
+        ok: true, deletedStudents: targets.length,
+        removedEssays: removedEssays, cleanupFailed: cleanupFailed
+      });
+    });
+  }
+
+  /* ---- 花名册文件导入：xlsx/csv 提取文本 → AI 识别（格式不固定）→ 预览；确认后应用 ---- */
+  if (pathname === '/api/roster/import-preview') {
+    const settings = Object.assign({}, DEFAULT_SETTINGS, await readJson(SETTINGS_FILE, {}));
+    if (!settings.apiKey || !settings.apiKey.trim()) {
+      return sendJson(res, 200, { ok: false, error: '尚未配置 API Key：花名册识别要用一次文本模型，请到「设置」填写后再导入' });
+    }
+    const b64 = String(body.dataBase64 || '').replace(/^data:[^,]*,/, '');
+    const buf = Buffer.from(b64, 'base64');
+    if (!buf.length) return sendJson(res, 200, { ok: false, error: '文件内容是空的' });
+    if (buf.length > 8 * 1024 * 1024) return sendJson(res, 200, { ok: false, error: '文件太大（超过 8MB），请拆分后再上传' });
+    let text;
+    try {
+      text = rosterFileToText(String(body.name || ''), buf);
+    } catch (err) {
+      return sendJson(res, 200, { ok: false, error: String(err.message || err) });
+    }
+    text = text.replace(/[ \t]+\n/g, '\n').trim();
+    if (!text) return sendJson(res, 200, { ok: false, error: '文件里没有读到任何文本内容' });
+    const clipped = text.length > 9000;
+    try {
+      const parsed = await callTextModel(settings, ROSTER_IMPORT_PROMPT,
+        '以下是花名册文件内容' + (clipped ? '（过长，已截断）' : '') + '，请识别出班级分组与学生：\n\n' + text.slice(0, 9000));
+      const groups = (Array.isArray(parsed.groups) ? parsed.groups : []).map(function (g) {
+        return {
+          className: String(g.className || '').trim(),
+          students: (Array.isArray(g.students) ? g.students : []).map(function (s) {
+            return { seatNo: digitsOf(s.seatNo || s.no || '').slice(0, 8), name: String(s.name || '').trim().replace(/[()（）]/g, '') };
+          }).filter(function (s) {
+            return /^[\u4e00-\u9fa5·]{2,4}$/.test(s.name) && !NOT_A_NAME.test(s.name);
+          })
+        };
+      }).filter(function (g) { return g.className && g.students.length; });
+      if (!groups.length) {
+        return sendJson(res, 200, { ok: false, error: 'AI 没有从文件里识别出任何学生，换一份更清晰的花名册或改用「批量添加」手动粘贴' });
+      }
+      return sendJson(res, 200, { ok: true, groups: groups, clipped: clipped, headText: text.slice(0, 200) });
+    } catch (err) {
+      return sendJson(res, 200, { ok: false, error: 'AI 识别失败：' + String(err.message || err) });
+    }
+  }
+
+  if (pathname === '/api/roster/import-apply') {
+    return await withData(async function () {
+      let groups = Array.isArray(body.groups) ? body.groups : [];
+      if (!groups.length) return sendJson(res, 200, { ok: false, error: '没有要导入的班级' });
+      // 同一个班可能出现多个组（比如多个 sheet 都是九(2)）：先按班合并去重，后到的组不能把前面的名单顶掉
+      const byCls = {};
+      const order = [];
+      groups.forEach(function (g) {
+        const className = String(g.className || '').trim();
+        if (!className) return;
+        const k = classKey(className);
+        if (!byCls[k]) { byCls[k] = { className: className, seen: {}, students: [] }; order.push(k); }
+        (Array.isArray(g.students) ? g.students : []).forEach(function (s) {
+          const name = String(s.name || '').trim().replace(/[()（）]/g, '');
+          if (!/^[\u4e00-\u9fa5·]{2,4}$/.test(name) || NOT_A_NAME.test(name)) return;
+          if (byCls[k].seen[name]) return;
+          byCls[k].seen[name] = 1;
+          byCls[k].students.push({ seatNo: digitsOf(s.seatNo || '').slice(0, 8), name: name });
+        });
+      });
+      groups = order.map(function (k) { return byCls[k]; });
+      const store = await loadRosters();
+      const students = await loadStudents();
+      const now = new Date().toISOString();
+      let added = 0, merged = 0;
+      const classes = [];
+      for (const g of groups) {
+        const className = String(g.className || '').trim();
+        const items = (Array.isArray(g.students) ? g.students : []).map(function (s) {
+          return { seatNo: digitsOf(s.seatNo || '').slice(0, 8), name: String(s.name || '').trim().replace(/[()（）]/g, '') };
+        }).filter(function (s) {
+          return className && /^[\u4e00-\u9fa5·]{2,4}$/.test(s.name) && !NOT_A_NAME.test(s.name);
+        });
+        if (!items.length) continue;
+        const k = classKey(className);
+        store.classes = store.classes.filter(function (c) { return classKey(c.className) !== k; });
+        store.classes.push({ className: className, students: items, updatedAt: now });
+        for (const it of items) {
+          const key = studentKey(className, it.name);
+          const hit = key ? students.students.find(function (s) { return s.key === key; }) : null;
+          if (hit) {
+            if (!hit.seatNo && it.seatNo) hit.seatNo = it.seatNo;
+            hit.updatedAt = now;
+            merged++;
+          } else {
+            students.students.push({
+              id: uid('s_'), key: key, name: it.name, className: className, seatNo: it.seatNo,
+              manual: true, createdAt: now, updatedAt: now
+            });
+            added++;
+          }
+        }
+        classes.push(className + '（' + items.length + ' 人）');
+      }
+      if (!classes.length) return sendJson(res, 200, { ok: false, error: '没有可导入的学生' });
+      await writeJson(ROSTERS_FILE, store);
+      await writeJson(STUDENTS_FILE, students);
+      return sendJson(res, 200, { ok: true, classes: classes, added: added, merged: merged });
     });
   }
 
@@ -3083,6 +3441,14 @@ async function handleApi(req, res, pathname, query) {
       b.essays.forEach(function (e) {
         if (!(e.identity || {}).name) cls[k].unnamed++;
       });
+    });
+    // 花名册里已建、还没有学生的班级（比如刚「添加班级」的空班）也进班级概览
+    const rostersForView = await loadRosters();
+    rostersForView.classes.forEach(function (c) {
+      const nm = String(c.className || '').trim();
+      if (!nm) return;
+      const disp = displayOf(nm);
+      if (!cls[disp]) cls[disp] = { className: disp, students: 0, essays: 0, scores: [], unnamed: 0 };
     });
     const classes = Object.keys(cls).map(function (k) {
       const c = cls[k];
