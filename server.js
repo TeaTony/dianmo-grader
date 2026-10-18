@@ -3242,26 +3242,64 @@ async function handleApi(req, res, pathname, query) {
         if (kk) keys.add(kk);
       });
       const db = await loadDb();
-      let removedEssays = 0, cleanupFailed = 0;
+      let removedEssays = 0, cleanupFailed = 0, clearedBatches = 0;
+      const involvedIds = new Set();   // 被删作文牵连的学生（含按默认班级归入、档案班级为空的）
+      const involvedKeys = new Set();
       for (const b of db.batches) {
+        // 这个班可能是批次的「默认班级」：默认归入它的、还没识别出自有班级的作文也算这个班的
+        const batchIsHis = classKey(b.className) === k;
         const keep = [];
         for (const e of b.essays) {
           const idt = e.identity || {};
+          const ownCls = String(idt.className || '').trim();
           const ek = idt.name ? studentKey(idt.className, idt.name) : '';
-          const isHis = (e.studentId && ids.has(String(e.studentId))) || (ek && keys.has(ek));
-          if (isHis) { removedEssays++; cleanupFailed += await removeFiles([e]); continue; }
+          const isHis = (e.studentId && ids.has(String(e.studentId))) ||              // 档案关联
+            (ek && keys.has(ek)) ||                                                    // 姓名＋班级对得上
+            classKey(ownCls) === k ||                                                  // 卷面上写的就是这个班
+            (batchIsHis && !ownCls);                                                   // 没写班级、按批次默认归入
+          if (isHis) {
+            if (e.studentId) involvedIds.add(String(e.studentId));
+            if (ek) involvedKeys.add(ek);
+            removedEssays++;
+            cleanupFailed += await removeFiles([e]);
+            continue;
+          }
           keep.push(e);
         }
         b.essays = keep;
+        // 清掉批次上的默认班级：否则空班级还会出现在班级概览与班级下拉里
+        if (batchIsHis) { b.className = ''; clearedBatches++; }
       }
-      students.students = students.students.filter(function (s) { return !ids.has(s.id); });
+      // 牵连档案清理：因这次删除而名下再无任何作文的学生档案一并删掉
+      // （比如班级为空、按批次默认班级归入的学生）；还有别的作文挂着的保留
+      const linkedIds = new Set();
+      const linkedKeys = new Set();
+      db.batches.forEach(function (b) {
+        b.essays.forEach(function (e) {
+          const idt = e.identity || {};
+          if (e.studentId) linkedIds.add(String(e.studentId));
+          const kk = idt.name ? studentKey(idt.className, idt.name) : '';
+          if (kk) linkedKeys.add(kk);
+        });
+      });
+      let cleanedArchives = 0;
+      students.students = students.students.filter(function (s) {
+        if (ids.has(s.id)) return false;
+        const involved = involvedIds.has(String(s.id)) || (s.key && involvedKeys.has(s.key));
+        if (!involved) return true;
+        const stillHas = linkedIds.has(String(s.id)) || (s.key && linkedKeys.has(s.key));
+        if (stillHas) return true;
+        cleanedArchives++;
+        return false;
+      });
       store.classes = store.classes.filter(function (c) { return classKey(c.className) !== k; });
       await writeJson(DB_FILE, db);
       await writeJson(STUDENTS_FILE, students);
       await writeJson(ROSTERS_FILE, store);
       return sendJson(res, 200, {
         ok: true, deletedStudents: targets.length,
-        removedEssays: removedEssays, cleanupFailed: cleanupFailed
+        removedEssays: removedEssays, clearedBatches: clearedBatches,
+        cleanedArchives: cleanedArchives, cleanupFailed: cleanupFailed
       });
     });
   }
