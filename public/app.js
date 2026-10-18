@@ -379,9 +379,11 @@ function renderBatchSelect() {
    ================================================================== */
 async function openBatch(id) {
   const r = await api('/api/batch/get', { id: id });
-  if (!r.ok) return;
+  if (!r.ok) { alert('打开批次失败：' + (r.error || '未知错误')); return; }
   S.current = r.batch;
-  S.open = new Set();
+  // 换批次时清掉只在本批次内有意义的界面状态：展开行、勾选、未归名勾选
+  S.rowOpen = new Set();
+  S.ck = new Set();
   S.editing = null;
   // 换批次时把雷同浮层的状态清掉：上一个批次的 key 在新批次里没有意义，
   // 而且浮层不该在切批次时自己弹回来（教师是主动点「雷同检测」才看的）
@@ -1753,7 +1755,7 @@ function nameCandidatesBlock(e) {
   if (!cands.length) return '';
   return '<div class="hint" style="margin-top:8px">候选姓名（点一下就填进上面的姓名框）：' +
     cands.map(function (c) {
-      const tag = c.from === 'roster' ? (c.seatNo ? c.seatNo + ' 号 · ' : '') + '名单' : '卷面认出';
+      const tag = c.from === 'roster' ? (c.seatNo ? esc(c.seatNo) + ' 号 · ' : '') + '名单' : '卷面认出';
       return '<button class="btn sm ghost" style="margin:4px 6px 0 0" data-act="pickname" data-id="' + e.id +
         '" data-name="' + esc(c.name) + '">' + esc(c.name) +
         '<span style="color:var(--ink3);font-weight:400;margin-left:6px">' + tag + '</span></button>';
@@ -2182,7 +2184,7 @@ async function renderRecords() {
     return;
   }
   const r = await api('/api/batch/get', { id: id });
-  if (!r.ok) return;
+  if (!r.ok) { alert('读取批次失败：' + (r.error || '未知错误')); return; }
   const b = r.batch;
   S.recordBatch = id;
   S.recordData = b;
@@ -2438,7 +2440,7 @@ function essayRowHtml(e, b, marksHtml) {
       : (idt.source === 'filename' ? '文件名' : (idt.source === 'ai' ? '卷面识别' : ''))));
   const box = (f, val, ph, w) => '<input type="text" class="rin' + (val ? ' filled' : '') +
     '" data-rf="' + f + '" data-re="' + e.id + '" value="' + esc(val || '') +
-    '" placeholder="' + ph + '"' + (w ? ' style="min-width:' + w + '"' : '') + '>';
+    '" placeholder="' + esc(ph) + '"' + (w ? ' style="min-width:' + w + '"' : '') + '>';
   const ck = S.ck || (S.ck = new Set());
   const open = S.rowOpen || (S.rowOpen = new Set());
   return '<tr data-row="' + e.id + '" style="cursor:pointer">' +
@@ -3300,6 +3302,8 @@ document.getElementById('classList').addEventListener('click', async function (e
   const c = ev.target.closest('[data-cls]');
   if (!c) return;
   S.archClass = c.dataset.cls;
+  // 未归名作文的勾选只在「当前班级」内有意义，切班级清掉，避免计数/按钮残留
+  S.unCk = new Set();
   document.getElementById('stuDetail').style.display = 'none';
   renderClassList();
   renderStudentList();

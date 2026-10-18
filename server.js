@@ -553,7 +553,13 @@ async function restoreFromSnapshot(file, prefix) {
     catch (e) { continue; }
     const bad = file + '.corrupt-' + stamp(new Date()) + '.json';
     try { await fsp.rename(file, bad); } catch (e) { /* 挪不动也继续恢复 */ }
-    await writeJson(file, obj);
+    try {
+      await writeJson(file, obj);
+    } catch (e) {
+      // 写回失败：把坏文件改回原名，避免「文件被改名、新文件没写成 → 下次读成空数据」的假象
+      try { await fsp.rename(bad, file); } catch (e2) { /* 回滚失败也留着 .corrupt-* 备查 */ }
+      throw e;
+    }
     return { file: path.basename(file), from: name, corrupt: path.basename(bad), at: new Date().toISOString() };
   }
   return null;
@@ -1612,8 +1618,7 @@ const DUP_PUBLIC_RATIO = 0.34; // 出现在 34% 以上篇目里的 n-gram → �
 const DUP_MIN_TOKENS = 20;     // 太短的作文不参与（多半只抄了题干已给句）
 const DUP_MIN_FRAG = 8;        // 连续重合不足 8 词不算
 const DUP_RED_LEN = 12;        // 红线：连续重合 ≥12 词
-const DUP_RED_PREV = 0.15;     // 红线：且该片段在全班出现 ≤15%
-const DUP_YELLOW_PREV = 0.40;  // 普遍度超过这个值算「全班背同一篇」，只统计不点名
+const DUP_RED_PREV = 0.15;     // 红线：且该片段除比对双方外全班几乎无人再写
 const DUP_MAX_FRAG = 3;        // 每对最多留 3 段重合片段给教师看
 
 /* 切成 token：汉字一字一个，英文数字一个词一个，顺带记下字符区间供前端高亮 */
@@ -1649,7 +1654,10 @@ function dupMaskPublic(items) {
   items.forEach(function (it, idx) {
     it.masked = it.toks.map(function (x) { return x.t; });
     for (let i = 0; i + DUP_NGRAM <= it.toks.length; i++) {
-      if ((df.get(dupGramAt(it.toks, i)) || 0) / N > DUP_PUBLIC_RATIO) {
+      const dfN = df.get(dupGramAt(it.toks, i)) || 0;
+      // 至少 3 篇都写才当「全班通用素材」遮蔽：df=2 的那对就是「比对的双方自己」，
+      // 小批次下 2/N 可能 >0.34，若不设 df≥3 下限，逐字相同的两篇会被整体遮蔽、检不出来
+      if (dfN >= 3 && dfN / N > DUP_PUBLIC_RATIO) {
         it.masked[i] = '\u0000' + idx + '\u0000' + i;
       }
     }
@@ -1683,17 +1691,20 @@ function dupFragments(a, b) {
   return segs.filter(function (s) { return s.aEnd - s.aStart >= DUP_MIN_FRAG; });
 }
 
-/* 一段 token 序列在全班的复现率（多少篇也写了这段） */
-function dupFragPrevalence(items, toks, s, e) {
+/* 一段 token 序列在全班的复现率（除比对双方外还有多少篇也写了这段） */
+function dupFragPrevalence(items, toks, s, e, excl) {
   if (e - s < DUP_NGRAM) return 0;
   const grams = new Set();
   for (let i = s; i + DUP_NGRAM <= e; i++) grams.add(dupGramAt(toks, i));
   if (!grams.size) return 0;
+  const denom = items.length - (excl ? excl.size : 0);
+  if (denom <= 0) return 0;
   let hit = 0;
   items.forEach(function (it) {
+    if (excl && excl.has(it.e.id)) return;
     for (const g of grams) { if (it.gramSet.has(g)) { hit++; break; } }
   });
-  return hit / items.length;
+  return hit / denom;
 }
 
 /* 对整批作文做雷同比对，返回 dupScan 结果对象（不落库） */
@@ -1728,10 +1739,11 @@ function dupBuildScan(b) {
       const top = segs.slice(0, DUP_MAX_FRAG);
       const maxLen = top[0].aEnd - top[0].aStart;
       const shorter = Math.min(a.toks.length, c.toks.length);
+      const excl = new Set([a.e.id, c.e.id]);
       const prevalence = top.reduce(function (s, seg) {
-        return Math.max(s, dupFragPrevalence(items, a.toks, seg.aStart, seg.aEnd));
+        return Math.max(s, dupFragPrevalence(items, a.toks, seg.aStart, seg.aEnd, excl));
       }, 0);
-      // 判定：≥12 词且全班 ≤15% → 红线；否则 ≥8 词 → 黄线
+      // 判定：≥12 词 且 除这对双方外几乎无人再写（≤15%）→ 红线；否则 ≥8 词 → 黄线
       const level = (maxLen >= DUP_RED_LEN && prevalence <= DUP_RED_PREV) ? 'copy' : 'tpl';
       const key = [a.e.id, c.e.id].sort().join('|');
       const fragments = top.map(function (seg) {
@@ -1780,14 +1792,13 @@ function dupBuildScan(b) {
     if (g.ids.size < 2) return;
     let hubId = '', hubN = -1;
     g.ids.forEach(function (id) { if (g.hubCount[id] > hubN) { hubN = g.hubCount[id]; hubId = id; } });
-    // 找分量内最长的一段红线片段作代表
+    // 找分量内最长的一段红线片段作代表（按 token 数比较，与返回的 len 口径一致）
     let bestFrag = null, bestLen = 0;
     redPairs.forEach(function (p) {
       if (g.ids.has(p.a.id) && g.ids.has(p.b.id)) {
         (p.fragments || []).forEach(function (f) {
           const it = idToItem[p.a.id];
-          const txt = it.text.slice(f.aStart, f.aEnd);
-          if (txt.length > bestLen) { bestLen = txt.length; bestFrag = { text: txt, len: p.overlap, prevalence: p.prevalence }; }
+          if (p.overlap > bestLen) { bestLen = p.overlap; bestFrag = { text: it.text.slice(f.aStart, f.aEnd), len: p.overlap, prevalence: p.prevalence }; }
         });
       }
     });
@@ -2117,12 +2128,24 @@ function unzipEntry(buf, wantName) {
     const localOff = buf.readUInt32LE(p + 42);
     const name = buf.slice(p + 46, p + 46 + nameLen).toString('utf8');
     if (name === wantName) {
+      // 防御损坏文件：本地头偏移越界直接放弃（否则 readUInt16LE 抛 RangeError 原文）
+      if (localOff + 30 > buf.length) return null;
       const lNameLen = buf.readUInt16LE(localOff + 26);
       const lExtraLen = buf.readUInt16LE(localOff + 28);
       const start = localOff + 30 + lNameLen + lExtraLen;
-      const comp = buf.slice(start, start + compSize);
+      if (start > buf.length) return null;
+      const comp = buf.slice(start, Math.min(start + compSize, buf.length));
       if (method === 0) return comp;
-      if (method === 8) return zlib.inflateRawSync(comp);
+      if (method === 8) {
+        // zip bomb 防护：声明压缩尺寸或解压后尺寸异常大就放弃
+        if (compSize > 64 * 1024 * 1024) return null;
+        try {
+          const inflated = zlib.inflateRawSync(comp, { maxOutputLength: 64 * 1024 * 1024 });
+          return inflated;
+        } catch (e) {
+          return null;
+        }
+      }
       return null;
     }
     p += 46 + nameLen + extraLen + commentLen;
@@ -2590,7 +2613,8 @@ function csvCell(v) {
   // Excel / WPS 公式注入防护：以 = + - @ 开头的单元格会被表格软件当公式执行
   // （如 =HYPERLINK(...)），前面补一个半角单引号把它固定成文本。
   // 正常数据（中文姓名、数字得分）不会以这四个字符开头，不受影响。
-  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  // 注意 \s 覆盖前导空白：Excel 会先剥掉前导空白再按公式解析，所以「空格 + =」也要拦。
+  if (/^\s*[=+\-@]/.test(s)) s = "'" + s;
   return '"' + s.replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"';
 }
 
@@ -2609,7 +2633,15 @@ async function serveStatic(req, res, pathname) {
 }
 
 async function serveUpload(req, res, pathname) {
-  const name = path.basename(decodeURIComponent(pathname));
+  let name;
+  try {
+    name = path.basename(decodeURIComponent(pathname));
+  } catch (e) {
+    // 畸形百分号编码（如 /uploads/%zz）→ 400，而不是 500
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
   const full = path.join(UPLOAD_DIR, name);
   if (!full.startsWith(UPLOAD_DIR)) { res.writeHead(403); res.end('forbidden'); return; }
   try {
@@ -2698,37 +2730,40 @@ async function handleApi(req, res, pathname, query) {
 
   /* ---- 保存配置 ---- */
   if (pathname === '/api/settings') {
-    const cur = Object.assign({}, DEFAULT_SETTINGS, await readJson(SETTINGS_FILE, {}));
-    const next = {
-      baseUrl: body.baseUrl !== undefined ? String(body.baseUrl).trim() : cur.baseUrl,
-      model: body.model !== undefined ? String(body.model).trim() : cur.model,
-      temperature: body.temperature !== undefined ? Number(body.temperature) : cur.temperature,
-      forceJson: body.forceJson !== undefined ? !!body.forceJson : cur.forceJson,
-      maxTokens: body.maxTokens !== undefined ? Number(body.maxTokens) : cur.maxTokens,
-      thinking: body.thinking !== undefined ? String(body.thinking) : cur.thinking,
-      modelEssay: body.modelEssay !== undefined ? !!body.modelEssay : !!cur.modelEssay,
-      timeout: body.timeout !== undefined ? Number(body.timeout) : cur.timeout,
-      apiKey: (function () {
-        if (body.apiKey === undefined) return cur.apiKey;
-        const k = String(body.apiKey).trim();
-        if (k === '__CLEAR__') return '';
-        return k !== '' ? k : cur.apiKey;
-      })()
-    };
-    await writeJson(SETTINGS_FILE, next);
-    if (typeof body.prompt === 'string' && body.prompt.trim()) {
-      if (body.prompt.trim() === '__DEFAULT__') {
-        await fsp.writeFile(PROMPT_FILE, DEFAULT_PROMPT, 'utf8');
-      } else {
-        // 用户可能粘回旧版完整提示词（末尾带输出格式段）：剥掉再存，磁盘上只留评分标准
-        const rubric = rubricOnly(body.prompt);
-        if (!rubric) {
-          return sendJson(res, 200, { ok: false, error: '提示词不能只包含输出格式要求（那部分由程序自动附加），请保留评分标准内容' });
+    // 读-改-写整段包进 withData：并发保存配置（双开标签页）不该互相覆盖丢更新
+    return await withData(async function () {
+      const cur = Object.assign({}, DEFAULT_SETTINGS, await readJson(SETTINGS_FILE, {}));
+      const next = {
+        baseUrl: body.baseUrl !== undefined ? String(body.baseUrl).trim() : cur.baseUrl,
+        model: body.model !== undefined ? String(body.model).trim() : cur.model,
+        temperature: body.temperature !== undefined ? Number(body.temperature) : cur.temperature,
+        forceJson: body.forceJson !== undefined ? !!body.forceJson : cur.forceJson,
+        maxTokens: body.maxTokens !== undefined ? Number(body.maxTokens) : cur.maxTokens,
+        thinking: body.thinking !== undefined ? String(body.thinking) : cur.thinking,
+        modelEssay: body.modelEssay !== undefined ? !!body.modelEssay : !!cur.modelEssay,
+        timeout: body.timeout !== undefined ? Number(body.timeout) : cur.timeout,
+        apiKey: (function () {
+          if (body.apiKey === undefined) return cur.apiKey;
+          const k = String(body.apiKey).trim();
+          if (k === '__CLEAR__') return '';
+          return k !== '' ? k : cur.apiKey;
+        })()
+      };
+      await writeJson(SETTINGS_FILE, next);
+      if (typeof body.prompt === 'string' && body.prompt.trim()) {
+        if (body.prompt.trim() === '__DEFAULT__') {
+          await writeAtomic(PROMPT_FILE, DEFAULT_PROMPT);
+        } else {
+          // 用户可能粘回旧版完整提示词（末尾带输出格式段）：剥掉再存，磁盘上只留评分标准
+          const rubric = rubricOnly(body.prompt);
+          if (!rubric) {
+            return sendJson(res, 200, { ok: false, error: '提示词不能只包含输出格式要求（那部分由程序自动附加），请保留评分标准内容' });
+          }
+          await writeAtomic(PROMPT_FILE, rubric);
         }
-        await fsp.writeFile(PROMPT_FILE, rubric, 'utf8');
       }
-    }
-    return sendJson(res, 200, { ok: true });
+      return sendJson(res, 200, { ok: true });
+    });
   }
 
   /* ---- 测试接口连通性 ---- */
@@ -2921,8 +2956,8 @@ async function handleApi(req, res, pathname, query) {
     const settings = Object.assign({}, DEFAULT_SETTINGS, await readJson(SETTINGS_FILE, {}));
     if (!settings.apiKey || !settings.apiKey.trim()) return sendJson(res, 400, { ok: false, error: '尚未配置 API Key，请到「设置」填写' });
     if (!settings.baseUrl || !settings.model) return sendJson(res, 400, { ok: false, error: '尚未配置接口地址或模型名称' });
-    // 评分标准来自可编辑的 prompt.txt（读不到回退内置默认）；输出格式契约永远由程序拼接
-    const rubric = rubricOnly(await fsp.readFile(PROMPT_FILE, 'utf8').catch(() => DEFAULT_PROMPT));
+    // 评分标准来自可编辑的 prompt.txt（读不到或空文件回退内置默认）；输出格式契约永远由程序拼接
+    const rubric = rubricOnly(await fsp.readFile(PROMPT_FILE, 'utf8').catch(() => DEFAULT_PROMPT)) || DEFAULT_PROMPT;
     const prompt = rubric + '\n\n' + OUTPUT_CONTRACT;
 
     // 先做只读预检（拿批改要用的题目与作文），404 在这里就能返回；
@@ -2933,15 +2968,21 @@ async function handleApi(req, res, pathname, query) {
     const e0 = b0.essays.find((x) => x.id === body.essayId);
     if (!e0) return sendJson(res, 404, { ok: false, error: '作文记录不存在' });
 
+    let alreadyGrading = false;
     await withData(async function () {
       const db = await loadDb();
       const b = findBatch(db, body.batchId);
       const e = b && b.essays.find((x) => x.id === body.essayId);
       if (b && e) {
+        // 同一篇并发批改去重：已经在批改中就不要再调一次模型（浪费一次 AI 调用/费用）
+        if (e.status === 'grading') { alreadyGrading = true; return; }
         e.status = 'grading';
         await writeJson(DB_FILE, db);
       }
     });
+    if (alreadyGrading) {
+      return sendJson(res, 200, { ok: false, error: '这一篇正在批改中，请稍候再试' });
+    }
 
     try {
       // 模型调用可能要几十秒，必须放在锁外，否则会挡住其它所有写库操作
@@ -3535,6 +3576,9 @@ async function handleApi(req, res, pathname, query) {
     if (!settings.apiKey || !settings.apiKey.trim()) {
       return sendJson(res, 200, { ok: false, error: '尚未配置 API Key：花名册识别要用一次文本模型，请到「设置」填写后再导入' });
     }
+    if (!settings.baseUrl || !settings.model) {
+      return sendJson(res, 200, { ok: false, error: '尚未配置接口地址或模型名称，请到「设置」填写后再导入' });
+    }
     const b64 = String(body.dataBase64 || '').replace(/^data:[^,]*,/, '');
     const buf = Buffer.from(b64, 'base64');
     if (!buf.length) return sendJson(res, 200, { ok: false, error: '文件内容是空的' });
@@ -3738,6 +3782,11 @@ async function handleApi(req, res, pathname, query) {
         unnamedEssays: c.unnamedEssays || [],
         avg: c.scores.length ? Math.round((c.scores.reduce(function (a, x) { return a + x; }, 0) / c.scores.length) * 10) / 10 : null
       };
+    }).filter(function (c) {
+      // 「（未填班级）」是未归名作文的汇总桶，只在有未归名作文时才有意义；
+      // 完全空的（批次默认班级为空、又没有未归名作文）不显示，避免班级概览里冒出无用空项
+      if (c.className === '（未填班级）' && c.students === 0 && c.essays === 0 && c.unnamed === 0) return false;
+      return true;
     });
 
     students.sort(function (a, b) {
