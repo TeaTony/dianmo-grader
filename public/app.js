@@ -242,22 +242,28 @@ function identityShot(file) {
         const topH = Math.max(1, Math.round(H * 0.26));    // 卷首条带：标题以上那一段
         const sideW = Math.max(1, Math.round(W * 0.20));   // 左右竖边：装订线常在这里
         const sideH = Math.max(1, Math.round(H * 0.6));    // 竖边只看上半部分，信息都在卷首附近
+        const tlW = Math.max(1, Math.round(W * 0.5));      // 左上四分之一：整张答题卡扫描件时，学生信息栏常在左上角
+        const tlH = Math.max(1, Math.round(H * 0.5));
         const TARGET_W = 1500;                             // 太宽了模型也会缩，1500 够用又不费钱
         const sTop = Math.min(3, TARGET_W / W);
         const sSide = Math.min(3, TARGET_W / sideH);       // 竖边旋转后是横的，按旋转后的宽度算
+        const sTL = Math.min(3, TARGET_W / tlW);           // 左上块放大到 TARGET_W
+        const w0 = Math.max(1, Math.round(tlW * sTL)), h0 = Math.max(1, Math.round(tlH * sTL));
         const w1 = Math.max(1, Math.round(W * sTop)), h1 = Math.max(1, Math.round(topH * sTop));
         const w2 = Math.max(1, Math.round(sideH * sSide)), h2 = Math.max(1, Math.round(sideW * sSide));
         const c = document.createElement('canvas');
-        c.width = Math.max(w1, w2);
-        c.height = h1 + h2 * 2 + 10;
+        c.width = Math.max(w0, w1, w2);
+        c.height = h0 + h1 + h2 * 2 + 15;
         const ctx = c.getContext('2d');
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, c.width, c.height);
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
-        // 第 1 条：卷首横条
-        ctx.drawImage(img, 0, 0, W, topH, 0, 0, w1, h1);
-        // 第 2、3 条：左右竖边，顺时针转 90° 再放，竖排字变成横排更好读
+        // 第 1 条：左上四分之一（整张答题卡扫描件时，学生信息栏常在左上角）
+        ctx.drawImage(img, 0, 0, tlW, tlH, 0, 0, w0, h0);
+        // 第 2 条：卷首横条
+        ctx.drawImage(img, 0, 0, W, topH, 0, h0 + 5, w1, h1);
+        // 第 3、4 条：左右竖边，顺时针转 90° 再放，竖排字变成横排更好读
         const drawSide = function (sx, dy) {
           ctx.save();
           ctx.translate(0, dy + h2);
@@ -265,8 +271,8 @@ function identityShot(file) {
           ctx.drawImage(img, sx, 0, sideW, sideH, 0, 0, h2, w2);
           ctx.restore();
         };
-        drawSide(0, h1 + 5);
-        drawSide(W - sideW, h1 + h2 + 10);
+        drawSide(0, h0 + h1 + 10);
+        drawSide(W - sideW, h0 + h1 + h2 + 15);
         done(c.toDataURL('image/jpeg', 0.85));
       } catch (e) {
         done('');
