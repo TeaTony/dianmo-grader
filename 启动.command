@@ -85,11 +85,60 @@ find_node() {
 }
 
 NODE_BIN="$(find_node)"
-if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
-  echo "  ✗ 没有找到 Node.js，无法启动。"
+
+install_node_macos() {
   echo ""
-  echo "    解决办法（任选一种）："
-  echo "      1. 到 https://nodejs.org 下载 LTS 版安装，装完重新双击本文件"
+  echo "  检测到本机还没有安装 Node.js，现在帮您自动安装 LTS 稳定版。"
+  echo "  安装过程中若弹出授权窗口，请输入开机密码并点「好」。"
+  echo ""
+
+  # 1) 装了 Homebrew 时优先用，版本最新、最省事
+  if command -v brew >/dev/null 2>&1; then
+    echo "  → 检测到 Homebrew，执行 brew install node（首次可能要几分钟）……"
+    if brew install node; then
+      echo "  ✓ Node.js 已通过 Homebrew 安装完成"
+    else
+      echo "  ✗ Homebrew 安装失败，改用官网安装包。"
+    fi
+  fi
+
+  # 2) 没装 brew 或 brew 失败：从官网下载 LTS 安装包（Apple 芯片 / Intel 通用）
+  if [ -z "$(find_node)" ]; then
+    local ver="" maj
+    for maj in 24 22; do
+      ver="$(curl -fsSL --max-time 20 "https://nodejs.org/dist/latest-v${maj}.x/" \
+        | grep -o 'node-v[0-9]*\.[0-9]*\.[0-9]*\.pkg' | head -1 | sed -e 's/^node-//' -e 's/\.pkg$//')"
+      [ -n "$ver" ] && break
+    done
+
+    if [ -z "$ver" ]; then
+      echo "  ✗ 没能从官网拿到最新版本号（可能网络不通），下面给出手动安装方法。"
+    else
+      local pkgfile="/tmp/node-${ver}.pkg"
+      echo "  → 正在下载 node-${ver}.pkg（约 90 MB）……"
+      if curl -fL --max-time 600 -o "$pkgfile" "https://nodejs.org/dist/${ver}/node-${ver}.pkg"; then
+        echo "  → 下载完成，正在安装（请在弹出的窗口里输入密码）……"
+        if osascript -e "do shell script \"installer -pkg '$pkgfile' -target /\" with administrator privileges" >/dev/null 2>&1; then
+          echo "  ✓ Node.js 已安装完成"
+        else
+          echo "  ✗ 安装没有完成（可能取消了授权），下面给出手动安装方法。"
+        fi
+      else
+        echo "  ✗ 下载失败，请检查网络，下面给出手动安装方法。"
+      fi
+    fi
+  fi
+}
+
+if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
+  install_node_macos
+  NODE_BIN="$(find_node)"
+fi
+
+if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
+  echo ""
+  echo "  ✗ 仍没有找到 Node.js，请手动安装后重新双击本文件："
+  echo "      1. 到 https://nodejs.org 下载 LTS 版安装"
   echo "      2. 装了 Homebrew 的话，在终端执行：brew install node"
   echo ""
   echo "    本平台不依赖任何第三方库，只要有 Node.js 就能跑。"

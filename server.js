@@ -1605,6 +1605,206 @@ async function callModelForEssay(settings, batch, essay, r) {
   };
 }
 
+/* ---------------- 雷同文检测（纯本地比对，不调用模型） ---------------- */
+
+const DUP_NGRAM = 5;           // 公共性判断用的 n-gram 长度
+const DUP_PUBLIC_RATIO = 0.34; // 出现在 34% 以上篇目里的 n-gram → 当作题干或全班通用素材，比对时遮蔽
+const DUP_MIN_TOKENS = 20;     // 太短的作文不参与（多半只抄了题干已给句）
+const DUP_MIN_FRAG = 8;        // 连续重合不足 8 词不算
+const DUP_RED_LEN = 12;        // 红线：连续重合 ≥12 词
+const DUP_RED_PREV = 0.15;     // 红线：且该片段在全班出现 ≤15%
+const DUP_YELLOW_PREV = 0.40;  // 普遍度超过这个值算「全班背同一篇」，只统计不点名
+const DUP_MAX_FRAG = 3;        // 每对最多留 3 段重合片段给教师看
+
+/* 切成 token：汉字一字一个，英文数字一个词一个，顺带记下字符区间供前端高亮 */
+function dupTokens(text) {
+  const src = String(text || '');
+  const out = [];
+  const re = /[\u4e00-\u9fff]|[A-Za-z0-9]+(?:['\u2019][A-Za-z]+)?/g;
+  let m;
+  while ((m = re.exec(src)) !== null) out.push({ t: m[0].toLowerCase(), s: m.index, e: m.index + m[0].length });
+  return out;
+}
+
+const dupGramAt = (toks, i) => toks.slice(i, i + DUP_NGRAM).map((x) => x.t).join('\u0001');
+
+function dupGramSet(toks) {
+  const s = new Set();
+  for (let i = 0; i + DUP_NGRAM <= toks.length; i++) s.add(dupGramAt(toks, i));
+  return s;
+}
+
+/* 把「全班都在用」的 n-gram 遮蔽掉：换成带篇目序号的哨兵，比对面永远撞不上。
+   这一步是防假阳性的关键 —— 不遮蔽，题干已给句会霸榜。 */
+function dupMaskPublic(items) {
+  const N = items.length;
+  const df = new Map();
+  items.forEach(function (it) {
+    const seen = new Set();
+    for (let i = 0; i + DUP_NGRAM <= it.toks.length; i++) {
+      const g = dupGramAt(it.toks, i);
+      if (!seen.has(g)) { seen.add(g); df.set(g, (df.get(g) || 0) + 1); }
+    }
+  });
+  items.forEach(function (it, idx) {
+    it.masked = it.toks.map(function (x) { return x.t; });
+    for (let i = 0; i + DUP_NGRAM <= it.toks.length; i++) {
+      if ((df.get(dupGramAt(it.toks, i)) || 0) / N > DUP_PUBLIC_RATIO) {
+        it.masked[i] = '\u0000' + idx + '\u0000' + i;
+      }
+    }
+  });
+}
+
+/* 两篇之间的连续重合段（masked token 序列上的 LCS 分段，返回 token 索引段） */
+function dupFragments(a, b) {
+  const A = a.masked, B = b.masked;
+  const m = A.length, n = B.length;
+  const dp = [];
+  for (let i = 0; i <= m; i++) dp.push(new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const segs = [];
+  let i = 0, j = 0, cur = null;
+  while (i < m && j < n) {
+    if (A[i] === B[j]) {
+      if (cur && cur.aEnd === i && cur.bEnd === j) { cur.aEnd = i + 1; cur.bEnd = j + 1; }
+      else { cur = { aStart: i, aEnd: i + 1, bStart: j, bEnd: j + 1 }; segs.push(cur); }
+      i++; j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+  return segs.filter(function (s) { return s.aEnd - s.aStart >= DUP_MIN_FRAG; });
+}
+
+/* 一段 token 序列在全班的复现率（多少篇也写了这段） */
+function dupFragPrevalence(items, toks, s, e) {
+  if (e - s < DUP_NGRAM) return 0;
+  const grams = new Set();
+  for (let i = s; i + DUP_NGRAM <= e; i++) grams.add(dupGramAt(toks, i));
+  if (!grams.size) return 0;
+  let hit = 0;
+  items.forEach(function (it) {
+    for (const g of grams) { if (it.gramSet.has(g)) { hit++; break; } }
+  });
+  return hit / items.length;
+}
+
+/* 对整批作文做雷同比对，返回 dupScan 结果对象（不落库） */
+function dupBuildScan(b) {
+  const out = { pairs: [], byEssay: {}, groups: [], scanned: 0, ms: 0, at: '', essays: (b.essays || []).length, note: '' };
+  const t0 = Date.now();
+  const items = [];
+  (b.essays || []).forEach(function (e) {
+    const r = hasResult(e) ? eff(e) : null;
+    const text = r ? String(r.transcription || '') : '';
+    const toks = dupTokens(text);
+    if (toks.length >= DUP_MIN_TOKENS) items.push({ e: e, toks: toks, text: text });
+  });
+  out.scanned = items.length;
+  out.at = new Date().toISOString();
+  if (items.length < 2) {
+    out.note = '这个批次里识别出原文、且足够长（≥' + DUP_MIN_TOKENS + ' 词）的作文不足 2 篇，无法比对。';
+    out.ms = Date.now() - t0;
+    return out;
+  }
+  items.forEach(function (it) { it.gramSet = dupGramSet(it.toks); });
+  dupMaskPublic(items);
+
+  const reviews = b.dupReviews || {};
+  const pairs = [];
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      const a = items[i], c = items[j];
+      const segs = dupFragments(a, c);
+      if (!segs.length) continue;
+      segs.sort(function (x, y) { return (y.aEnd - y.aStart) - (x.aEnd - x.aStart); });
+      const top = segs.slice(0, DUP_MAX_FRAG);
+      const maxLen = top[0].aEnd - top[0].aStart;
+      const shorter = Math.min(a.toks.length, c.toks.length);
+      const prevalence = top.reduce(function (s, seg) {
+        return Math.max(s, dupFragPrevalence(items, a.toks, seg.aStart, seg.aEnd));
+      }, 0);
+      // 判定：≥12 词且全班 ≤15% → 红线；否则 ≥8 词 → 黄线
+      const level = (maxLen >= DUP_RED_LEN && prevalence <= DUP_RED_PREV) ? 'copy' : 'tpl';
+      const key = [a.e.id, c.e.id].sort().join('|');
+      const fragments = top.map(function (seg) {
+        return {
+          aStart: a.toks[seg.aStart].s, aEnd: a.toks[seg.aEnd - 1].e,
+          bStart: c.toks[seg.bStart].s, bEnd: c.toks[seg.bEnd - 1].e
+        };
+      });
+      const pair = {
+        key: key,
+        level: level,
+        verdict: reviews[key] || '',
+        a: { id: a.e.id, no: a.e.no, name: ((a.e.identity || {}).name) || '' },
+        b: { id: c.e.id, no: c.e.no, name: ((c.e.identity || {}).name) || '' },
+        overlap: maxLen,
+        cover: shorter ? Math.round((maxLen / shorter) * 100) / 100 : 0,
+        prevalence: prevalence,
+        fragments: fragments
+      };
+      pairs.push(pair);
+      out.byEssay[a.e.id] = true;
+      out.byEssay[c.e.id] = true;
+    }
+  }
+
+  // 聚类：红线对连边，union-find 找连通分量
+  const parent = {};
+  const find = function (x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const union = function (x, y) { const rx = find(x), ry = find(y); if (rx !== ry) parent[ry] = rx; };
+  items.forEach(function (it) { parent[it.e.id] = it.e.id; });
+  const redPairs = pairs.filter(function (p) { return p.level === 'copy'; });
+  redPairs.forEach(function (p) { union(p.a.id, p.b.id); });
+  const comp = {};
+  redPairs.forEach(function (p) {
+    const root = find(p.a.id);
+    if (!comp[root]) comp[root] = { ids: new Set(), copyN: 0, hubCount: {} };
+    comp[root].ids.add(p.a.id); comp[root].ids.add(p.b.id);
+    comp[root].copyN++;
+    comp[root].hubCount[p.a.id] = (comp[root].hubCount[p.a.id] || 0) + 1;
+    comp[root].hubCount[p.b.id] = (comp[root].hubCount[p.b.id] || 0) + 1;
+  });
+  const idToItem = {};
+  items.forEach(function (it) { idToItem[it.e.id] = it; });
+  Object.keys(comp).forEach(function (root) {
+    const g = comp[root];
+    if (g.ids.size < 2) return;
+    let hubId = '', hubN = -1;
+    g.ids.forEach(function (id) { if (g.hubCount[id] > hubN) { hubN = g.hubCount[id]; hubId = id; } });
+    // 找分量内最长的一段红线片段作代表
+    let bestFrag = null, bestLen = 0;
+    redPairs.forEach(function (p) {
+      if (g.ids.has(p.a.id) && g.ids.has(p.b.id)) {
+        (p.fragments || []).forEach(function (f) {
+          const it = idToItem[p.a.id];
+          const txt = it.text.slice(f.aStart, f.aEnd);
+          if (txt.length > bestLen) { bestLen = txt.length; bestFrag = { text: txt, len: p.overlap, prevalence: p.prevalence }; }
+        });
+      }
+    });
+    out.groups.push({
+      size: g.ids.size,
+      essays: Array.from(g.ids).map(function (id) { return { no: idToItem[id].e.no }; }),
+      copyN: g.copyN,
+      hubNo: idToItem[hubId].e.no,
+      topFrags: bestFrag ? [bestFrag] : []
+    });
+  });
+  out.groups.sort(function (a, b) { return b.copyN - a.copyN; });
+  out.pairs = pairs;
+  out.ms = Date.now() - t0;
+  return out;
+}
+
 /* ---------------- 班级共性分析（纯文本，成本低） ---------------- */
 
 function buildClassUserText(batch) {
@@ -2850,6 +3050,38 @@ async function handleApi(req, res, pathname, query) {
       }
       await writeJson(DB_FILE, db);
       return sendJson(res, 200, { ok: true, cleanupFailed: failed, uploadDir: UPLOAD_DIR });
+    });
+  }
+
+  /* ---- 雷同文检测：纯本地比对，不调用模型、不花钱 ---- */
+  if (pathname === '/api/dup/scan') {
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      b.dupScan = dupBuildScan(b);
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, dupScan: b.dupScan });
+    });
+  }
+
+  if (pathname === '/api/dup/review') {
+    return await withData(async function () {
+      const db = await loadDb();
+      const b = findBatch(db, body.batchId);
+      if (!b) return sendJson(res, 404, { ok: false, error: '批次不存在' });
+      const key = String(body.key || '');
+      const verdict = String(body.verdict || '');
+      if (!key) return sendJson(res, 200, { ok: false, error: '缺少对子标识' });
+      if (['', 'confirmed', 'dismissed'].indexOf(verdict) === -1) {
+        return sendJson(res, 200, { ok: false, error: 'verdict 取值不正确' });
+      }
+      b.dupReviews = b.dupReviews || {};
+      if (verdict) b.dupReviews[key] = verdict; else delete b.dupReviews[key];
+      // 重算一次，让角标 / 概览数字跟着变
+      b.dupScan = dupBuildScan(b);
+      await writeJson(DB_FILE, db);
+      return sendJson(res, 200, { ok: true, dupScan: b.dupScan });
     });
   }
 

@@ -19,7 +19,13 @@ const S = {
   archClass: '',
   qThumb: '',
   batchEditId: null,
-  stuRecords: []
+  stuRecords: [],
+  dupFull: new Set(),   // 雷同浮层里点开了「对照原文」的那几对
+  dupWhole: new Set(),  // 其中又点了「看全文」的那几对（其余只显示片段前后一小段）
+  dupYellow: false,     // 黄线（同模板疑似）默认收起，展开过才置 true
+  dupDead: false,       // 已标记误报的那一叠默认也收起
+  dupScroll: null,      // 浮层上次的滚动位置，点「看全文」重渲染后不跳回顶部
+  essayFilter: 'all'    // 作文列表筛选：all / todo / dup / bad
 };
 
 /* ==================================================================
@@ -74,6 +80,29 @@ async function downloadApi(path) {
 const esc = (s) => String(s === undefined || s === null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+/* 卡片头/空态用的小图标。用内联 SVG 而不是 emoji：
+   emoji 在不同系统上长得不一样，字号行高也不好控，混排进 15px 的圆角块里会歪 */
+const ICONS = {
+  list: '<path d="M4 6h12M4 10h12M4 14h8"/>',
+  chart: '<path d="M4.5 16V9M10 16V4.5M15.5 16v-5"/>',
+  table: '<rect x="3.5" y="4" width="13" height="12" rx="2"/><path d="M3.5 8h13M8.5 8v8"/>',
+  rows: '<rect x="3.5" y="4" width="13" height="12" rx="2"/><path d="M3.5 8h13M3.5 12h13"/>',
+  grid: '<rect x="3.5" y="3.5" width="5.5" height="5.5" rx="1.5"/><rect x="11" y="3.5" width="5.5" height="5.5" rx="1.5"/><rect x="3.5" y="11" width="5.5" height="5.5" rx="1.5"/><rect x="11" y="11" width="5.5" height="5.5" rx="1.5"/>',
+  user: '<circle cx="10" cy="7.5" r="3"/><path d="M4.5 16.5c.9-3 3-4.6 5.5-4.6s4.6 1.6 5.5 4.6"/>',
+  doc: '<path d="M6 3.5h5l3.5 3.5v9.5h-8.5z"/><path d="M11 3.5V7h3.5"/>',
+  box: '<path d="M3.5 6.5l6.5-3 6.5 3v7l-6.5 3-6.5-3z"/><path d="M3.5 6.5l6.5 3 6.5-3M10 9.5v7"/>',
+  folder: '<path d="M3.5 6.5a2 2 0 012-2h2.6l1.4 2h5a2 2 0 012 2v5a2 2 0 01-2 2h-9a2 2 0 01-2-2z"/>',
+  chev: '<path d="M6.5 8.5l3.5 3.5 3.5-3.5"/>',
+  warn: '<path d="M10 3.9l6.3 11.1H3.7z"/><path d="M10 8.3v3.1M10 13.5v.01"/>'
+};
+/* 图标一律 20×20 视框、1.6 线宽、跟随文字颜色，保证全站视觉一致 */
+function icon(name, size) {
+  const p = ICONS[name] || '';
+  const s = size || 20;
+  return '<svg viewBox="0 0 20 20" width="' + s + '" height="' + s +
+    '" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">' + p + '</svg>';
+}
 
 function tierClass(score) {
   if (score >= 21) return 'b1';
@@ -354,6 +383,15 @@ async function openBatch(id) {
   S.current = r.batch;
   S.open = new Set();
   S.editing = null;
+  // 换批次时把雷同浮层的状态清掉：上一个批次的 key 在新批次里没有意义，
+  // 而且浮层不该在切批次时自己弹回来（教师是主动点「雷同检测」才看的）
+  S.dupFull = new Set();
+  S.dupWhole = new Set();
+  S.dupYellow = false;
+  S.dupDead = false;
+  S.dupScroll = null;
+  S.essayFilter = 'all';
+  closeDupOverlay(false);
   document.getElementById('batchSelect').value = id;
   renderWorkbench();
 }
@@ -620,7 +658,8 @@ function renderWorkbench() {
 
   if (!b) {
     sub.textContent = '';
-    info.innerHTML = '<div class="empty"><div class="ic">📋</div>还没有批改批次<br>点右上角「＋ 新建批次」，填好作文题目和 3 个核心要点再上传照片</div>';
+    info.innerHTML = '<div class="empty"><div class="ic">' + icon('list', 34) +
+      '</div>还没有批改批次<br>点右上角「＋ 新建批次」，填好作文题目和 3 个核心要点再上传照片</div>';
     up.style.display = 'none';
     document.getElementById('essayList').innerHTML = '';
     document.getElementById('resSub').textContent = '';
@@ -778,9 +817,9 @@ document.getElementById('btnGrade').addEventListener('click', async function () 
     }
 
     // 教师可能中途切换了批次：只更新还停留在这个批次上的界面
+    // 卡片保持收起：批量批改时一屏能看到的篇目更多，要看哪篇点哪篇
     if (S.current && S.current.id === batchId) {
       S.current.essays.push(up.essay);
-      S.open.add(up.essay.id);
       renderEssays();
     }
 
@@ -826,13 +865,117 @@ document.getElementById('btnGrade').addEventListener('click', async function () 
 });
 
 /* ---------- 结果卡片 ---------- */
+/* 筛选口径：只影响「显示哪些篇目」。批量按钮（重批 / 生成范文 / 导出）
+   永远对整批生效，所以按钮旁要写清作用范围，免得教师以为只处理筛出来的那几篇。 */
+function essayMatch(e, f, red) {
+  if (f === 'todo') return hasResult(e) && !e.reviewed;
+  if (f === 'dup') return red.has(e.id);
+  if (f === 'bad') return needsRegrade(e);
+  return true;
+}
+
+function renderEssayTools(b) {
+  const box = document.getElementById('essayTools');
+  if (!box) return;
+  const red = dupRedEssayIds();
+  const counts = {
+    all: b.essays.length,
+    todo: b.essays.filter((e) => hasResult(e) && !e.reviewed).length,
+    dup: b.essays.filter((e) => red.has(e.id)).length,
+    bad: b.essays.filter(needsRegrade).length
+  };
+  const h = ['<div class="esstools"><div class="seg">'];
+  [['all', '全部'], ['todo', '待复核'], ['dup', '有雷同'], ['bad', '批改失败']].forEach(function (it) {
+    h.push('<button data-filter="' + it[0] + '"' + (S.essayFilter === it[0] ? ' class="on"' : '') + '>' +
+      it[1] + '<i>' + counts[it[0]] + '</i></button>');
+  });
+  h.push('</div><span class="hint">筛选只改这张列表显示哪几篇；' +
+    '上面的重批、生成范文、导出按钮始终作用于整批 ' + b.essays.length + ' 篇。' +
+    '「待复核」＝已有 AI 结果、你还没拍板的篇目；「有雷同」只算红线牵扯的篇目。</span></div>');
+  box.innerHTML = h.join('');
+}
+
+/* 工作台的「一键填写班级」工具行（登分表那份在 index.html 里，是静态的） */
+function clsBarHtml(p) {
+  return '<div class="clsbar">' +
+    '<b>一键填写班级</b>' +
+    '<input type="text" id="' + p + 'clsFillInput" list="clsOptions" placeholder="如 九二班">' +
+    '<button class="btn sm" id="' + p + 'btnFillClassSelected" disabled>填到勾选的 <span id="' + p + 'clsFillCount">0</span> 篇</button>' +
+    '<a href="javascript:void(0)" id="' + p + 'ckBlank" style="font-size:12px">选空白</a>' +
+    '<a href="javascript:void(0)" id="' + p + 'ckAll" style="font-size:12px">全选</a>' +
+    '<a href="javascript:void(0)" id="' + p + 'ckNone" style="font-size:12px">全不选</a>' +
+    '<span class="hint" id="' + p + 'clsFillHint"></span></div>';
+}
+
+/* 工作台展开行：成绩明细（rosterDetailInner）+ 范文 + 操作按钮；编辑态换成复核表单 */
+function wbDetailRow(e) {
+  const r = eff(e);
+  const isEdit = S.editing === e.id;
+  let inner = '';
+  if (isEdit) {
+    inner = reviewForm(e, r || {});
+  } else if (e.status === 'error') {
+    inner = '<div class="err"><b>批改失败：</b>' + esc(e.aiError || '未知错误') +
+      '<div style="margin-top:6px">点下方「重新批改」可再试一次。</div></div>' +
+      (e.aiRaw ? '<div class="blk"><h5>模型返回原文</h5><div class="ta mono">' + esc(e.aiRaw) + '</div></div>' : '');
+  } else if (e.status === 'pending') {
+    inner = '<div class="note">这篇还没有批改。点下方「立即批改」开始。</div>';
+  } else if (e.status === 'grading') {
+    inner = '<div class="note">正在批改中，请稍候…</div>';
+  } else if (isEmptyResult(e.ai)) {
+    inner = '<div class="err"><b>这篇的批改结果是空的，不能当成绩用。</b>' +
+      '<div style="margin-top:6px">模型这次没有返回任何识别文本或评语（属于偶发故障），不是学生真的得 0 分。点下方「重新批改」即可。</div></div>';
+  } else {
+    inner = rosterDetailInner(e, r);
+    const meText = modelEssayOf(e);
+    if (meText) {
+      const me = {
+        text: meText,
+        notes: (e.modelEssayRes && e.modelEssayRes.notes) || [],
+        keyPhrases: (e.modelEssayRes && e.modelEssayRes.keyPhrases) || []
+      };
+      inner += '<div class="blk"><h5>适配水平优化范文</h5><div class="ta" style="max-height:230px;overflow:auto">' + esc(me.text) + '</div>';
+      if (me.notes.length) {
+        inner += '<div style="margin-top:9px;font-size:12.5px;color:var(--ink2)"><b>为什么这样改：</b><ul style="margin:4px 0 0;padding-left:17px">' +
+          me.notes.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul></div>';
+      }
+      if (me.keyPhrases.length) {
+        inner += '<div style="margin-top:9px;font-size:12.5px;color:var(--blue)"><b>背下来能加分的好词好句：</b><ul style="margin:4px 0 0;padding-left:17px">' +
+          me.keyPhrases.map((k) => '<li>' + esc(k) + '</li>').join('') + '</ul></div>';
+      }
+      inner += '</div>';
+    }
+  }
+  // 操作按钮（data-act 与原卡片一致，走同一个分发）
+  let btns = '<div class="btn-row" style="margin-top:14px">';
+  if (isEdit) {
+    btns += '<button class="btn" data-act="save" data-id="' + e.id + '">保存复核结果</button>' +
+      '<button class="btn ghost" data-act="cancel" data-id="' + e.id + '">取消</button>' +
+      '<button class="btn ghost" data-act="restore" data-id="' + e.id + '">撤回为 AI 原评</button>';
+  } else {
+    if (e.status === 'done') btns += '<button class="btn" data-act="review" data-id="' + e.id + '">教师复核 / 修改</button>';
+    btns += '<button class="btn ' + (e.status === 'done' ? 'ghost' : 'orange') + '" data-act="one" data-id="' + e.id + '">' +
+      (e.status === 'done' ? '重新批改' : '立即批改') + '</button>';
+    btns += '<button class="btn ghost" data-act="scanid" data-id="' + e.id + '">识别姓名</button>';
+    btns += '<button class="btn ghost" data-act="del" data-id="' + e.id + '">删除</button>';
+  }
+  btns += '</div>';
+  return '<tr class="rdet"><td></td><td colspan="9" ' +
+    'style="background:rgba(37,99,235,.05);padding:10px 14px;max-height:520px;overflow:auto">' +
+    inner + btns + '</td></tr>';
+}
+
 function renderEssays() {
   const box = document.getElementById('essayList');
   const b = S.current;
   const btn = document.getElementById('btnRegrade');
+  const tools = document.getElementById('essayTools');
   if (!b || !b.essays.length) {
-    box.innerHTML = '<div class="empty"><div class="ic">🗂</div>这个批次还没有作文<br>选好照片后点「开始批改」，结果会按编号出现在这里</div>';
+    if (tools) tools.innerHTML = '';
+    box.innerHTML = '<div class="empty"><div class="ic">' + icon('box', 34) +
+      '</div>这个批次还没有作文<br>选好照片后点「开始批改」，结果会按编号出现在这里</div>';
     document.getElementById('resSub').textContent = '';
+    document.getElementById('btnMakeEssays').style.display = 'none';
     btn.style.display = 'none';
     return;
   }
@@ -840,6 +983,8 @@ function renderEssays() {
   const rev = b.essays.filter((e) => e.reviewed).length;
   const bad = b.essays.filter(needsRegrade).length;
   document.getElementById('resSub').textContent = '共 ' + b.essays.length + ' 篇 · 已批改 ' + done + ' · 已复核 ' + rev;
+  const db = document.getElementById('btnDup');
+  if (db && !db.disabled) db.textContent = dupButtonText(b);
   if (bad) {
     btn.style.display = 'inline-block';
     btn.textContent = '重批未成功的 ' + bad + ' 篇';
@@ -860,8 +1005,382 @@ function renderEssays() {
     mk.style.display = 'none';
   }
 
-  box.innerHTML = b.essays.map(essayCard).join('');
+  renderEssayTools(b);
+  const red = dupRedEssayIds();
+  const shown = b.essays.filter((e) => essayMatch(e, S.essayFilter, red));
+  if (!shown.length) {
+    box.innerHTML = '<div class="empty"><div class="ic">' + icon('box', 34) +
+      '</div>按当前筛选条件没有可显示的篇目<br>点上面的「全部」看整批</div>';
+    return;
+  }
+  // 与登分表同款的表格：勾选 + 一键填写班级 + 点行展开
+  const ck = S.ck || (S.ck = new Set());
+  const open = S.rowOpen || (S.rowOpen = new Set());
+  const head = ['编号', '姓名', '班级', '考号', '得分', '档次', '状态', '原卷'];
+  let html = clsBarHtml('wb') + '<div class="tbl-wrap"><table id="wbTable">' +
+    '<thead><tr><th style="width:26px"><input type="checkbox" id="wbckHead" title="全选 / 全不选"></th>' +
+    head.map((h) => '<th>' + h + '</th>').join('') + '<th style="width:30px"></th></tr></thead><tbody>';
+  shown.forEach(function (e) {
+    // 雷同 / 抄袭小角标挂在状态列（原卡片头部 essayMarks 的信息挪到这里）
+    let marks = '';
+    if (red.has(e.id)) marks += dupBadgeFor(e);
+    const pl = plagiarismBadge(e.ai && e.ai.plagiarism);
+    if (pl) marks += pl;
+    html += essayRowHtml(e, b, marks);
+    if (open.has(String(e.id))) html += wbDetailRow(e);
+  });
+  html += '</tbody></table></div>';
+  box.innerHTML = html;
+  fillClassBar('wb', b);
+  const hc = document.getElementById('wbckHead');
+  if (hc) hc.checked = b.essays.length > 0 && shown.every((e) => ck.has(String(e.id)));
 }
+
+/* ==================================================================
+   雷同文检测
+   算法全在服务端跑（纯本地比对，不调用模型），这里只负责把结果画出来。
+   面板里的重合片段用的是「原文里的字符区间」，所以能直接在转录原文上高亮，
+   教师看到的还是学生原本的拼写和标点，不是被切碎的关键词。
+   ================================================================== */
+function dupLabel(x) {
+  const nm = String((x && x.name) || '').trim();
+  return (x.no) + ' 号' + (nm ? '（' + esc(nm) + '）' : '');
+}
+
+/* 把重叠片段画成高亮；不展开全文时，只截片段前后各一段，省得教师翻长文 */
+function dupTextHtml(text, spans, full) {
+  const t = String(text || '');
+  const list = (spans || [])
+    .filter((x) => x && x.s >= 0 && x.e > x.s && x.e <= t.length)
+    .sort((a, c) => a.s - c.s);
+  let from = 0, to = t.length;
+  if (!full && list.length) {
+    from = Math.max(0, list[0].s - 80);
+    to = Math.min(t.length, list[list.length - 1].e + 80);
+  }
+  const cut = t.slice(from, to);
+  const shifted = list.filter((x) => x.s >= from && x.e <= to)
+    .map((x) => ({ s: x.s - from, e: x.e - from }));
+  let out = '', pos = 0;
+  shifted.forEach(function (sp) {
+    if (sp.s < pos) return;
+    out += esc(cut.slice(pos, sp.s)) + '<mark class="dupmark">' + esc(cut.slice(sp.s, sp.e)) + '</mark>';
+    pos = sp.e;
+  });
+  out += esc(cut.slice(pos));
+  return (from > 0 ? '<span class="ellip">…</span>' : '') + out +
+    (to < t.length ? '<span class="ellip">…</span>' : '');
+}
+
+/* 有红线牵扯的篇目：只算「没被标成误报」的红线对。
+   黄线一律不参与，否则一次扫描下来二十多篇里有十几篇都带标记，
+   满屏红黄块等于没有信息 —— 教师反而看不出该先看哪一篇。 */
+function dupCopyPairs() {
+  const ds = S.current && S.current.dupScan;
+  return ((ds && ds.pairs) || []).filter((p) => p.level === 'copy' && p.verdict !== 'dismissed');
+}
+function dupRedEssayIds() {
+  const set = new Set();
+  dupCopyPairs().forEach(function (p) { set.add(p.a.id); set.add(p.b.id); });
+  return set;
+}
+
+/* 作文卡片上的小标记：只有红线牵扯的篇目才出现，点它开浮层并定位到这一篇。
+   形态和其它小标记一致（浅底 + 描边 + 图形 + 文字），不靠整块红底喊人。 */
+function dupBadgeFor(e) {
+  const mine = dupCopyPairs().filter((p) => p.a.id === e.id || p.b.id === e.id);
+  if (!mine.length) return '';
+  const others = [];
+  mine.forEach(function (p) {
+    const no = p.a.id === e.id ? p.b.no : p.a.no;
+    if (others.indexOf(no) === -1) others.push(no);
+  });
+  return '<span class="badge mini mini-dup" data-dupact="open" data-no="' + e.no +
+    '" title="与 ' + esc(others.join('、')) + ' 号有 ' + mine.length + ' 对红线重合，点击查看原文对照">' +
+    icon('warn', 11) + '雷 ' + mine.length + ' 对</span>';
+}
+
+/* 全班复现率：四舍五入到 0% 时「全班 0% 的篇目也这么写」读起来自相矛盾，
+   这类数字换成一句话更准 */
+function dupPrevalence(v) {
+  const n = Math.round((v || 0) * 100);
+  return n <= 0 ? '全班只有这一对这么写' : '全班 ' + n + '% 的篇目也这么写';
+}
+function dupPrevShort(v) {
+  const n = Math.round((v || 0) * 100);
+  return n <= 0 ? '全班几乎没有别的人写' : '全班 ' + n + '% 的篇目也有';
+}
+
+/* 一对子默认只占一行：谁跟谁、几词重合、占短文多少、两张原图缩略图。
+   双列高亮原文点「对照原文」才渲染 —— 这是把整块面板从几千像素压到一屏的关键。 */
+function dupPairHtml(p) {
+  const b = S.current;
+  const shown = S.dupFull.has(p.key);
+  const whole = S.dupWhole.has(p.key);
+  const ea = b.essays.find((x) => x.id === p.a.id);
+  const eb = b.essays.find((x) => x.id === p.b.id);
+  if (!ea || !eb) return '';
+  const frags = p.fragments || [];
+  const red = p.level === 'copy';
+  const h = [];
+  h.push('<div class="duprow ' + (red ? 'lv-copy' : 'lv-tpl') + (shown ? ' open' : '') +
+    '" data-a="' + p.a.no + '" data-b="' + p.b.no + '">');
+  h.push('<div class="duphead">');
+  h.push('<span class="duplv ' + (red ? 'copy' : 'tpl') + '">' + (red ? '红线' : '黄线') + '</span>');
+  h.push('<b><a data-dupact="goto" data-no="' + p.a.no + '">' + dupLabel(p.a) + '</a> ↔ ' +
+    '<a data-dupact="goto" data-no="' + p.b.no + '">' + dupLabel(p.b) + '</a></b>');
+  h.push('<span class="dupmeta">连续重合 ' + p.overlap + ' 词 · 占短文 ' + Math.round(p.cover * 100) +
+    '% · ' + dupPrevalence(p.prevalence) + '</span>');
+  h.push('<span class="sp"></span>');
+  if (p.verdict === 'confirmed') h.push('<span class="badge mini mini-dup">已确认</span>');
+  h.push('<img class="dupthumb" src="/uploads/' + esc(ea.file) + '" data-dupact="img" data-file="' + esc(ea.file) + '" alt="' + p.a.no + ' 号原图">');
+  h.push('<img class="dupthumb" src="/uploads/' + esc(eb.file) + '" data-dupact="img" data-file="' + esc(eb.file) + '" alt="' + p.b.no + ' 号原图">');
+  h.push('<button class="btn sm ghost" data-dupact="full" data-key="' + esc(p.key) + '">' +
+    (!shown ? '对照原文' : (whole ? '收起' : '看全文')) + '</button>');
+  if (p.verdict === 'confirmed') {
+    h.push('<button class="btn sm ghost" data-dupact="clear" data-key="' + esc(p.key) + '">撤销确认</button>');
+  } else if (p.verdict !== 'dismissed') {
+    h.push('<button class="btn sm ghost" data-dupact="confirm" data-key="' + esc(p.key) + '">确认雷同</button>');
+    h.push('<button class="btn sm ghost" data-dupact="dismiss" data-key="' + esc(p.key) + '">标记误报</button>');
+  } else {
+    h.push('<button class="btn sm ghost" data-dupact="clear" data-key="' + esc(p.key) + '">撤销误报</button>');
+  }
+  h.push('</div>');
+
+  if (shown) {
+    const ta = String(((eff(ea) || {}).transcription) || '');
+    const tb = String(((eff(eb) || {}).transcription) || '');
+    h.push('<div class="dupbody">');
+    h.push('<div class="dupcol"><div class="dupno">' + p.a.no + ' 号</div><div class="duptext' +
+      (whole ? ' full' : '') + '">' +
+      dupTextHtml(ta, frags.map((f) => ({ s: f.aStart, e: f.aEnd })), whole) + '</div></div>');
+    h.push('<div class="dupcol"><div class="dupno">' + p.b.no + ' 号</div><div class="duptext' +
+      (whole ? ' full' : '') + '">' +
+      dupTextHtml(tb, frags.map((f) => ({ s: f.bStart, e: f.bEnd })), whole) + '</div></div>');
+    h.push('</div>');
+  }
+  h.push('</div>');
+  return h.join('');
+}
+/* 雷同结果整块搬进浮层：主流程的作文列表不再被顶开。
+   面板顺序＝教师看的顺序：概览 → 小团体 → 红线 → 黄线（折起）→ 误报（折起） */
+function renderDupOverlay() {
+  const box = document.getElementById('dupBody');
+  const b = S.current;
+  if (!box) return;
+  const ds = b && b.dupScan;
+  if (!ds) { box.innerHTML = ''; return; }
+
+  const all = ds.pairs || [];
+  const dead = all.filter((p) => p.verdict === 'dismissed');
+  const live = all.filter((p) => p.verdict !== 'dismissed');
+  const red = live.filter((p) => p.level === 'copy');
+  const yellow = live.filter((p) => p.level !== 'copy');
+  const touched = Object.keys(ds.byEssay || {}).length;
+  const h = [];
+
+  const cap = document.getElementById('dupCap');
+  if (cap) cap.textContent = b.title + ' · 共 ' + b.essays.length + ' 篇作文';
+
+  // 概览用整句播报（「扫描 24 篇，红线 3 对」），屏幕阅读器不会听到一串裸数字
+  h.push('<div class="duphd"><span class="dupdot">雷</span>' +
+    '<b id="dupTitle" tabindex="-1">雷同检测</b><span class="sp"></span>' +
+    '<span class="dupmeta num" role="status" aria-live="polite">扫描 ' + ds.scanned + ' 篇有效原文，红线 ' +
+    red.length + ' 对，黄线 ' + yellow.length + ' 对，涉及 ' + touched + ' 篇，用时 ' + (ds.ms || 0) + ' 毫秒' +
+    (ds.at ? '，扫描于 ' + fmtDate(ds.at) : '') + '</span></div>');
+  h.push('<div class="hint">原文来自批改时的识别结果，<b>不调用模型、不花钱</b>。' +
+    '红线＝连续重合 ≥12 词、且全班只有极少数篇目也这么写；黄线＝重合 8 词以上，' +
+    '也可能只是背了同一套句型。判学生传抄前，点开两张原图对照字迹。</div>');
+  // 扫完之后又传了新照片 / 新批了作文，这份结果就不全了，提醒重扫一次
+  if (ds.essays && b.essays.length !== ds.essays) {
+    h.push('<div class="note">这个批次的作文数量在上次扫描后变了（当时 ' + ds.essays +
+      ' 篇，现在 ' + b.essays.length + ' 篇），点「重新扫描」才是最新的。</div>');
+  }
+
+  if (ds.scanned < 2) {
+    h.push('<div class="tip">' + esc(ds.note || '这个批次可比对的原文不足 2 篇。') + '</div>');
+    box.innerHTML = h.join('');
+    return;
+  }
+
+  // 小团体压成一行摘要：一个源头带一圈人，这类事单看对子清单最容易漏
+  (ds.groups || []).filter((g) => g.copyN > 0).forEach(function (g) {
+    h.push('<div class="dupgroup"><div class="dupghead">疑似小团体 · ' + g.size + ' 篇　' +
+      g.essays.map((e) => '<a data-dupact="goto" data-no="' + e.no + '">' + e.no + ' 号</a>').join('、') +
+      '<span class="dupmeta">红线 ' + g.copyN + ' 对 · 牵连最多的是 ' + g.hubNo + ' 号</span></div>');
+    (g.topFrags || []).slice(0, 1).forEach(function (f) {
+      h.push('<div class="dupsent"><mark class="dupmark">' + esc(f.text) + '</mark>' +
+        '<span class="dupmeta">' + f.len + ' 词 · ' + dupPrevShort(f.prevalence) + '</span></div>');
+    });
+    h.push('</div>');
+  });
+
+  h.push('<div class="duplist">' + (red.length
+    ? red.map(dupPairHtml).join('')
+    : '<div class="tip">这一批没有红线对子。' + (yellow.length
+      ? '黄线 ' + yellow.length + ' 对可能只是同模板，需要时点下面的按钮展开。' : '') + '</div>') + '</div>');
+
+  if (yellow.length) {
+    h.push('<button class="dupmore" data-dupact="yellow">' + icon('chev', 14) +
+      ' 黄线 ' + yellow.length + ' 对（同模板或短句巧合，可能只是都背了同一套句型）· ' +
+      (S.dupYellow ? '收起' : '展开') + '</button>');
+    h.push('<div class="duplist"' + (S.dupYellow ? '' : ' hidden') + '>' +
+      yellow.map(dupPairHtml).join('') + '</div>');
+  }
+
+  if (dead.length) {
+    h.push('<div class="dupdismissed"><button class="dupmore" data-dupact="dead">' + icon('chev', 14) +
+      ' 已标记误报 ' + dead.length + ' 对，不影响上面的结论 · ' + (S.dupDead ? '收起' : '展开') + '</button>' +
+      '<div class="dupdead"' + (S.dupDead ? '' : ' hidden') + '>' +
+      dead.map(dupPairHtml).join('') + '</div></div>');
+  }
+
+  box.innerHTML = h.join('');
+  // 点「看全文」会重渲染整个浮层，这里把滚动位置放回去，不然会跳回顶部
+  if (S.dupScroll != null) box.scrollTop = S.dupScroll;
+}
+
+/* 浮层开 / 关。focusNo 有值时（从卡片小标记进来）滚动到这一篇的第一对 */
+function openDupOverlay(focusNo) {
+  const m = document.getElementById('dupModal');
+  if (!m) return;
+  S.dupScroll = null;
+  renderDupOverlay();
+  m.classList.add('on');
+  const box = document.getElementById('dupBody');
+  if (box) box.scrollTop = 0;
+  if (focusNo) {
+    const row = box && box.querySelector('.duprow[data-a="' + focusNo + '"],.duprow[data-b="' + focusNo + '"]');
+    if (row) {
+      row.scrollIntoView({ block: 'start' });
+      row.classList.add('mark');
+      setTimeout(function () { row.classList.remove('mark'); }, 1600);
+    }
+  }
+  const t = document.getElementById('dupTitle');
+  if (t) t.focus();
+}
+
+/* 关掉之后不自己弹回来：只有再点「雷同检测」或卡片上的「雷」标记才会开 */
+function closeDupOverlay(refocus) {
+  const m = document.getElementById('dupModal');
+  if (!m) return;
+  const wasOpen = m.classList.contains('on');
+  m.classList.remove('on');
+  S.dupScroll = null;
+  if (wasOpen && refocus !== false) {
+    const btn = document.getElementById('btnDup');
+    if (btn) btn.focus();
+  }
+}
+
+/* 按钮上的计数：「雷同检测 · 红线 3 对」。没有红线时不挂后缀，
+   免得按钮自己变成一块提示牌。 */
+function dupButtonText(b) {
+  const n = dupCopyPairs().length;
+  return n ? '雷同检测 · 红线 ' + n + ' 对' : '雷同检测';
+}
+
+/* 跑一次扫描（服务端本地算完落库）。扫完只更新按钮上的计数和卡片标记，
+   浮层不自动打开 —— 什么时候看由教师决定，打开批次时首屏必须是第 1 篇作文。 */
+async function dupScan() {
+  const b = S.current;
+  if (!b) { alert('请先选择一个批次'); return null; }
+  const btn = document.getElementById('btnDup');
+  if (btn) { btn.disabled = true; btn.textContent = '扫描中…'; }
+  const r = await api('/api/dup/scan', { batchId: b.id });
+  if (btn) btn.disabled = false;
+  if (!r.ok || !r.dupScan) {
+    if (btn) btn.textContent = dupButtonText(b);
+    alert('雷同检测失败：' + ((r && r.error) || '未知错误'));
+    return null;
+  }
+  b.dupScan = r.dupScan;
+  if (btn) btn.textContent = dupButtonText(b);
+  renderEssays();
+  const m = document.getElementById('dupModal');
+  if (m && m.classList.contains('on')) renderDupOverlay();
+  return r.dupScan;
+}
+
+/* 浮层里的所有动作走这一个入口：卡片上的「雷」标记和浮层内部共用 */
+async function dupAct(el) {
+  const act = el.getAttribute('data-dupact');
+  const b = S.current;
+  if (!b) return;
+
+  if (act === 'close') {
+    S.dupScroll = (document.getElementById('dupBody') || {}).scrollTop || 0;
+    closeDupOverlay();
+    return;
+  }
+  if (act === 'rescan') { await dupScan(); return; }
+  if (act === 'open') { openDupOverlay(Number(el.getAttribute('data-no'))); return; }
+  if (act === 'yellow') { S.dupYellow = !S.dupYellow; renderDupOverlay(); return; }
+  if (act === 'dead') { S.dupDead = !S.dupDead; renderDupOverlay(); return; }
+  if (act === 'img') {
+    document.getElementById('modalImg').src = '/uploads/' + el.getAttribute('data-file');
+    document.getElementById('modalCap').textContent = '作文原图';
+    document.getElementById('modal').classList.add('on');
+    return;
+  }
+  if (act === 'full') {
+    // 三档：收起 → 只给片段前后一小段 → 给整篇原文
+    const k = el.getAttribute('data-key');
+    S.dupScroll = (document.getElementById('dupBody') || {}).scrollTop || 0;
+    if (!S.dupFull.has(k)) { S.dupFull.add(k); S.dupWhole.delete(k); }
+    else if (!S.dupWhole.has(k)) { S.dupWhole.add(k); }
+    else { S.dupFull.delete(k); S.dupWhole.delete(k); }
+    renderDupOverlay();
+    return;
+  }
+  if (act === 'goto') {
+    // 跳到该篇 ＝ 关浮层 + 筛选切回「全部」+ 滚到那张卡片并闪一下
+    const no = Number(el.getAttribute('data-no'));
+    const e = b.essays.find((x) => x.no === no);
+    if (!e) return;
+    closeDupOverlay(false);
+    S.essayFilter = 'all';
+    (S.rowOpen || (S.rowOpen = new Set())).add(String(e.id));
+    renderEssays();
+    flashEssay(e.id);
+    return;
+  }
+  if (act === 'confirm' || act === 'dismiss' || act === 'clear') {
+    const key = el.getAttribute('data-key');
+    const verdict = act === 'clear' ? '' : (act === 'confirm' ? 'confirmed' : 'dismissed');
+    const r = await api('/api/dup/review', { batchId: b.id, key: key, verdict: verdict });
+    if (!r.ok) { alert('标记失败：' + ((r && r.error) || '未知错误')); return; }
+    // 重扫一次：小团体、角标、概览数字要跟着变，纯本地算所以毫秒级
+    await dupScan();
+    return;
+  }
+}
+
+/* 滚到某篇并高亮一下，让教师一眼找到是哪一张卡 */
+function flashEssay(id) {
+  const tr = document.querySelector('#wbTable tr[data-row="' + id + '"]');
+  if (!tr) return;
+  tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  tr.style.outline = '2px solid var(--warn)';
+  setTimeout(function () { tr.style.outline = ''; }, 1400);
+}
+
+document.getElementById('btnDup').addEventListener('click', async function () {
+  const b = S.current;
+  if (!b) { alert('请先选择一个批次'); return; }
+  // 没扫过就先扫一遍；扫过就直接开浮层，不重复算
+  if (!b.dupScan) { await dupScan(); return; }
+  openDupOverlay(null);
+});
+
+document.getElementById('dupClose').addEventListener('click', function () { closeDupOverlay(); });
+document.getElementById('dupRescan').addEventListener('click', function () { dupScan(); });
+document.getElementById('dupModal').addEventListener('click', function (ev) {
+  if (ev.target === this) { closeDupOverlay(); return; }
+  const el = ev.target.closest('[data-dupact]');
+  if (el) dupAct(el);
+});
 
 /* ==================================================================
    学生范文生成 & 学生报告导出
@@ -976,7 +1495,6 @@ document.getElementById('btnRegrade').addEventListener('click', async function (
     await api('/api/essay/reset', { batchId: b.id, essayId: item.id });
     const idx = S.current.essays.findIndex((x) => x.id === item.id);
     if (idx > -1) S.current.essays[idx].status = 'grading';
-    S.open.add(item.id);
     renderEssays();
 
     const res = await api('/api/grade', { batchId: b.id, essayId: item.id });
@@ -1017,6 +1535,22 @@ document.getElementById('btnRegrade').addEventListener('click', async function (
   setTimeout(function () { pw.style.display = 'none'; pt.style.display = 'none'; }, 5000);
 });
 
+/* 卡片上的「标记」——只放真正需要教师回头处理的：雷同红线牵扯、AI 判抄袭、
+   得分口径对不上。单张卡片最多两个，按重要性取前面的；
+   档次、状态属于常规信息，不占这 2 个额度。 */
+function essayMarks(e, r, sc) {
+  const marks = [];
+  const dup = dupBadgeFor(e);
+  if (dup) marks.push(dup);
+  const pl = plagiarismBadge(e.ai && e.ai.plagiarism);
+  if (pl) marks.push(pl);
+  if (sc !== null && scoreGap(r) !== 0 && marks.length < 2) {
+    marks.push('<span class="badge mini mini-gap" title="四维之和与最终得分对不上，详见卡片里的「得分口径待核对」">' +
+      icon('warn', 11) + '得分待核</span>');
+  }
+  return marks.join('');
+}
+
 function essayCard(e) {
   const r = eff(e);
   const isOpen = S.open.has(e.id);
@@ -1028,13 +1562,12 @@ function essayCard(e) {
     '<img class="thumb" src="/uploads/' + esc(e.file) + '" data-act="img" data-id="' + e.id + '" alt="">' +
     '<div class="meta"><div class="t1">' + e.no + ' 号作文　' + statusBadge(e) +
     (sc !== null && r && r.tier ? '<span class="badge ' + tierClass(sc) + '">' + esc(r.tier) + '</span>' : '') +
-    (sc !== null && scoreGap(r) !== 0 ? '<span class="badge bg-warn">得分待核</span>' : '') +
-    plagiarismBadge(e.ai && e.ai.plagiarism) +
+    essayMarks(e, r, sc) +
     '</div><div class="t2">' + fmtDate(e.createdAt) +
     (r && r.wordCount ? '　·　识别词数 ' + r.wordCount : '') +
     (r && r.deductions && r.deductions.length ? '　·　扣分 ' + r.deductions.length + ' 项' : '') +
     '</div></div>' +
-    '<div class="sc">' + (sc !== null ? '<b>' + sc + '<i>/25</i></b>' : '<b style="color:#94A3B8">—</b>') + '</div>' +
+    '<div class="sc">' + (sc !== null ? '<b>' + sc + '<i>/25</i></b>' : '<b class="dim">—</b>') + '</div>' +
     '</div>';
 
   if (!isOpen) return '<div class="essay">' + head + '</div>';
@@ -1087,21 +1620,32 @@ function essayCard(e) {
               '<span>' + esc(p.point) + (p.note ? '　<span class="nt">' + esc(p.note) + '</span>' : '') + '</span></li>';
           }).join('') + '</ul></div>';
       }
-      body += errorsBlock(e.ai && e.ai.errors);
+      // 紧凑排版：逐句纠错限高滚动；短列表两列排布，长文本（范文/原文）限高滚动
+      const eb = errorsBlock(e.ai && e.ai.errors);
+      if (eb) body += '<div style="max-height:250px;overflow:auto">' + eb + '</div>';
       body += plagiarismBlock(e.ai && e.ai.plagiarism);
-      body += teacherNoteBlock(r.teacherNote);
+      const duoA = [];
       if (r.deductions && r.deductions.length) {
-        body += '<div class="blk warn"><h5>硬性扣分</h5><ul>' +
-          r.deductions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
+        duoA.push('<div class="blk warn" style="flex:1;min-width:250px"><h5>硬性扣分</h5><ul>' +
+          r.deductions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>');
       }
+      const tn = teacherNoteBlock(r.teacherNote);
+      if (tn) duoA.push('<div style="flex:1;min-width:250px">' + tn + '</div>');
+      if (duoA.length === 2) {
+        body += '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">' + duoA.join('') + '</div>';
+      } else if (duoA.length) body += duoA[0];
+      const duoB = [];
       if (r.problems && r.problems.length) {
-        body += '<div class="blk warn"><h5>核心问题</h5><ul>' +
-          r.problems.map((x, i) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
+        duoB.push('<div class="blk warn" style="flex:1;min-width:250px"><h5>核心问题</h5><ul>' +
+          r.problems.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>');
       }
       if (r.suggestions && r.suggestions.length) {
-        body += '<div class="blk"><h5>改进建议</h5><ul>' +
-          r.suggestions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
+        duoB.push('<div class="blk" style="flex:1;min-width:250px"><h5>改进建议</h5><ul>' +
+          r.suggestions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>');
       }
+      if (duoB.length === 2) {
+        body += '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">' + duoB.join('') + '</div>';
+      } else if (duoB.length) body += duoB[0];
       if (r.comment) body += '<div class="blk"><h5>综合评语</h5><div class="ta">' + esc(r.comment) + '</div></div>';
 
       const meText = modelEssayOf(e);
@@ -1111,7 +1655,7 @@ function essayCard(e) {
         keyPhrases: (e.modelEssayRes && e.modelEssayRes.keyPhrases) || []
       } : null;
       if (me && me.text) {
-        body += '<div class="blk"><h5>适配水平优化范文</h5><div class="ta">' + esc(me.text) + '</div>';
+        body += '<div class="blk"><h5>适配水平优化范文</h5><div class="ta" style="max-height:230px;overflow:auto">' + esc(me.text) + '</div>';
         if (me.notes && me.notes.length) {
           body += '<div style="margin-top:9px;font-size:12.5px;color:var(--ink2)"><b>为什么这样改：</b><ul style="margin:4px 0 0;padding-left:17px">' +
             me.notes.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul></div>';
@@ -1123,7 +1667,7 @@ function essayCard(e) {
         body += '</div>';
       }
 
-      if (r.transcription) body += '<div class="blk"><h5>识别原文</h5><div class="ta mono">' + esc(r.transcription) + '</div></div>';
+      if (r.transcription) body += '<div class="blk"><h5>识别原文</h5><div class="ta mono" style="max-height:210px;overflow:auto">' + esc(r.transcription) + '</div></div>';
     }
   }
 
@@ -1161,11 +1705,16 @@ function errorsBlock(errors) {
     }).join('') + '</ul></div>';
 }
 
-/* 抄袭判定：判定抄袭 / 疑似抄袭两种情况，只给老师看，不进学生报告 */
+/* 抄袭判定：判定抄袭 / 疑似抄袭两种情况，只给老师看，不进学生报告。
+   和雷同标记共用一套小标记形态 —— 整块红底太抢眼，反而看不出哪篇该先看 */
 function plagiarismBadge(pl) {
   if (!pl || !pl.verdict || pl.verdict === 'clean') return '';
-  if (pl.verdict === 'copied') return '<span class="badge bg-err">判定抄袭</span>';
-  return '<span class="badge bg-warn">疑似抄袭</span>';
+  if (pl.verdict === 'copied') {
+    return '<span class="badge mini mini-copy" title="AI 认定有整段抄袭，详见卡片里的「抄袭判定」">' +
+      icon('warn', 11) + '判定抄袭</span>';
+  }
+  return '<span class="badge mini mini-copy" title="AI 觉得像抄的，需要点开原图人工核对">' +
+    icon('warn', 11) + '疑似抄袭</span>';
 }
 function plagiarismBlock(pl) {
   if (!pl || !pl.verdict || pl.verdict === 'clean') return '';
@@ -1244,7 +1793,7 @@ function identityBlock(e) {
   h += nameCandidatesBlock(e);
   h += idScanHint(e);
   if (idf.title || idf.firstSentence) {
-    h += '<div style="margin-top:10px;padding:10px 12px;background:#F8FAFD;border:1px solid var(--line);border-radius:10px;font-size:13px">' +
+    h += '<div style="margin-top:10px;padding:10px 12px;background:var(--sunken);border:1px solid var(--line);border-radius:10px;font-size:13px">' +
       (idf.title ? '<div><b>自写标题：</b>' + esc(idf.title) + '</div>' : '<div><b>自写标题：</b>未写标题</div>') +
       (idf.firstSentence ? '<div style="margin-top:3px"><b>正文首句：</b>' + esc(idf.firstSentence) + '</div>' : '') +
       '</div>';
@@ -1297,7 +1846,18 @@ function reviewForm(e, r) {
 const splitLines = (s) => String(s || '').split('\n').map((x) => x.trim()).filter(Boolean);
 
 /* ---------- 结果区交互 ---------- */
+/* 结果列表上方的分段筛选：只切显示，不碰批量按钮的作用范围 */
+document.getElementById('essayTools').addEventListener('click', function (ev) {
+  const btn = ev.target.closest('[data-filter]');
+  if (!btn) return;
+  S.essayFilter = btn.getAttribute('data-filter');
+  renderEssays();
+});
+
 document.getElementById('essayList').addEventListener('click', async function (ev) {
+  // 卡片上的「雷」标记走雷同浮层那一套动作，别被下面的卡片展开逻辑吃掉
+  const dupEl = ev.target.closest('[data-dupact]');
+  if (dupEl) { dupAct(dupEl); return; }
   const t = ev.target.closest('[data-act]');
   if (!t) return;
   const act = t.dataset.act;
@@ -1309,11 +1869,11 @@ document.getElementById('essayList').addEventListener('click', async function (e
 
   if (act === 'img') { openImg(e); return; }
   if (act === 'toggle') {
-    if (S.open.has(id)) S.open.delete(id); else S.open.add(id);
+    if (S.rowOpen.has(String(id))) S.rowOpen.delete(String(id)); else S.rowOpen.add(String(id));
     renderEssays();
     return;
   }
-  if (act === 'review') { S.editing = id; S.open.add(id); renderEssays(); return; }
+  if (act === 'review') { S.editing = id; S.rowOpen.add(String(id)); renderEssays(); return; }
   if (act === 'cancel') { S.editing = null; renderEssays(); return; }
 
   if (act === 'restore') {
@@ -1423,6 +1983,109 @@ document.getElementById('essayList').addEventListener('click', async function (e
   }
 });
 
+/* ---------- 工作台表格的交互（与登分表同一套：行展开 / 勾选 / 工具行 / 行内编辑） ---------- */
+
+/* 点行（按钮 / 勾选框 / 输入框 / 候选 / 缩略图以外的地方）→ 展开或收起这一篇 */
+document.getElementById('essayList').addEventListener('click', function (ev) {
+  if (ev.target.closest('input, a, button, img, .rin, [data-act]')) return;
+  const tr = ev.target.closest('#wbTable tr[data-row]');
+  if (!tr) return;
+  const id = String(tr.getAttribute('data-row'));
+  const open = S.rowOpen || (S.rowOpen = new Set());
+  if (open.has(id)) open.delete(id); else open.add(id);
+  renderEssays();
+});
+
+/* 工具行「一键填写班级」（wb 前缀那套，data 由 id 区分） */
+document.getElementById('essayList').addEventListener('click', function (ev) {
+  const el = ev.target.closest('#wbckBlank, #wbckAll, #wbckNone, #wbbtnFillClassSelected');
+  if (!el) return;
+  if (el.id === 'wbckBlank') selectRows('wb', true);
+  else if (el.id === 'wbckAll') selectRows('wb', false);
+  else if (el.id === 'wbckNone') {
+    (S.ck || (S.ck = new Set())).clear();
+    renderEssays();
+    updateClsFillCount();
+  } else fillClass('wb');
+});
+
+/* 勾选框（行内 + 表头全选） */
+document.getElementById('essayList').addEventListener('change', function (ev) {
+  const el = ev.target;
+  const ck = S.ck || (S.ck = new Set());
+  if (el.id === 'wbckHead') {
+    if (el.checked) selectRows('wb', false);
+    else { ck.clear(); renderEssays(); }
+    return;
+  }
+  if (!el.classList || !el.classList.contains('rowck')) return;
+  const id = el.getAttribute('data-ck');
+  if (el.checked) ck.add(String(id)); else ck.delete(String(id));
+  updateClsFillCount();
+  const hc = document.getElementById('wbckHead');
+  if (hc && S.current) {
+    hc.checked = S.current.essays.length > 0 && S.current.essays.every((e) => ck.has(String(e.id)));
+  }
+});
+
+/* 姓名栏回车 → 跳到下一行的姓名栏；Esc → 失焦保存 */
+document.getElementById('essayList').addEventListener('keydown', function (ev) {
+  const el = ev.target;
+  if (!el.classList || !el.classList.contains('rin')) return;
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    el.blur();
+    const rows = Array.prototype.slice.call(document.querySelectorAll('#wbTable tbody tr[data-row]'));
+    const idx = rows.indexOf(el.closest('tr'));
+    const next = rows[idx + 1];
+    if (next) {
+      const n = next.querySelector('[data-rf="name"]');
+      if (n) n.focus();
+    }
+  } else if (ev.key === 'Escape') {
+    el.blur();
+  }
+});
+
+/* 候选姓名点一下 → 填进姓名栏并保存（工作台表格实例） */
+document.getElementById('essayList').addEventListener('click', function (ev) {
+  const a = ev.target.closest('[data-cand]');
+  if (!a) return;
+  ev.preventDefault();
+  const id = a.getAttribute('data-re');
+  const row = document.querySelector('#wbTable tr[data-row="' + id + '"]');
+  const input = row && row.querySelector('[data-rf="name"]');
+  if (!input) return;
+  input.value = a.getAttribute('data-cand');
+  input.classList.add('filled');
+  saveRosterRow(id, '#wbTable');
+});
+
+/* 原卷缩略图点一下 → 放大弹层 */
+document.getElementById('essayList').addEventListener('click', function (ev) {
+  const img = ev.target.closest('.paper-thumb');
+  if (!img) return;
+  ev.preventDefault();
+  document.getElementById('modalImg').src = img.getAttribute('data-zoom');
+  document.getElementById('modalCap').textContent = img.getAttribute('data-cap') || '作文原图';
+  document.getElementById('modal').classList.add('on');
+});
+
+/* 行内身份编辑失焦保存（工作台表格实例） */
+document.getElementById('essayList').addEventListener('focusout', function (ev) {
+  const el = ev.target;
+  if (!el.classList || !el.classList.contains('rin')) return;
+  const row = el.closest('tr');
+  const id = row && row.getAttribute('data-row');
+  if (!id) return;
+  const src = (S.current ? (S.current.essays.find((e) => e.id === id) || {}).identity : null) || {};
+  const same = Array.prototype.every.call(row.querySelectorAll('.rin'), function (x) {
+    return x.value.trim() === String(src[x.getAttribute('data-rf')] || '').trim();
+  });
+  if (same) return;
+  saveRosterRow(id, '#wbTable');
+});
+
 /* ---------- 图片预览 ---------- */
 function openImg(e) {
   document.getElementById('modalImg').src = '/uploads/' + e.file;
@@ -1466,7 +2129,7 @@ document.getElementById('essayList').addEventListener('input', function (ev) {
   const val = (p) => Number((document.getElementById(p + '-' + id) || {}).value) || 0;
   const sum = val('rv-c') + val('rv-l') + val('rv-s') + val('rv-h');
   const sc = val('rv-score');
-  box.style.color = sum === sc ? '' : '#B45309';
+  box.style.color = sum === sc ? '' : 'var(--warn)';
   box.textContent = sum === sc
     ? '四维合计 ' + sum + ' 分 ＝ 最终得分 ' + sc + ' 分 ✓'
     : '⚠ 四维合计 ' + sum + ' 分，最终得分 ' + sc + ' 分，差 ' + Math.abs(sc - sum) + ' 分。两者相等才不会有争议。';
@@ -1474,11 +2137,13 @@ document.getElementById('essayList').addEventListener('input', function (ev) {
 document.getElementById('modal').addEventListener('click', function (ev) {
   if (ev.target === this) this.classList.remove('on');
 });
-/* Esc 一层一层关：先关放大图，再关「某一篇详情」 */
+/* Esc 一层一层关：先关放大图，再关雷同浮层，最后关「某一篇详情」 */
 document.addEventListener('keydown', function (ev) {
   if (ev.key !== 'Escape') return;
   const m = document.getElementById('modal');
   if (m && m.classList.contains('on')) { m.classList.remove('on'); return; }
+  const d = document.getElementById('dupModal');
+  if (d && d.classList.contains('on')) { closeDupOverlay(); return; }
   const r = document.getElementById('recModal');
   if (r && r.classList.contains('on')) r.classList.remove('on');
 });
@@ -1489,7 +2154,7 @@ document.addEventListener('keydown', function (ev) {
 function renderBatchList() {
   const box = document.getElementById('batchList');
   if (!S.batches.length) {
-    box.innerHTML = '<div class="empty"><div class="ic">📚</div>还没有历史批次</div>';
+    box.innerHTML = '<div class="empty"><div class="ic">' + icon('folder', 34) + '</div>还没有历史批次</div>';
     return;
   }
   box.innerHTML = S.batches.map(function (b) {
@@ -1513,7 +2178,7 @@ async function renderRecords() {
   const id = S.recordBatch || (S.current ? S.current.id : (S.batches[0] && S.batches[0].id));
   if (!id) {
     document.getElementById('statCard').style.display = 'none';
-    document.getElementById('tableCard').style.display = 'none';
+    document.getElementById('rosterCard').style.display = 'none';
     return;
   }
   const r = await api('/api/batch/get', { id: id });
@@ -1544,7 +2209,8 @@ async function renderRecords() {
     else if (n >= 11) buckets[2]++; else if (n >= 6) buckets[3]++; else buckets[4]++;
   });
   const names = ['一档 优秀', '二档 良好', '三档 合格', '四档 较差', '五档 极差'];
-  const colors = ['#059669', '#2563EB', '#D97706', '#EA580C', '#DC2626'];
+  // 与档次角标同源：颜色只在 styles.css 的 token 层定义，这里引用变量
+  const colors = ['var(--t1)', 'var(--t2)', 'var(--t3)', 'var(--t4)', 'var(--t5)'];
   const totalN = nums.length || 1;
   document.getElementById('dist').innerHTML = '<div style="font-size:13px;font-weight:700;margin:6px 0 10px">档次分布</div>' +
     names.map(function (n, i) {
@@ -1556,33 +2222,7 @@ async function renderRecords() {
   renderAnalysis(b);
   renderClassAnalysis(b);
 
-  document.getElementById('tableCard').style.display = 'block';
-  const head = ['编号', '得分', '档次', '内容', '语言', '结构', '书写', '词数', '状态', '核心问题'];
-  let html = '<thead><tr>' + head.map((h) => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>';
-  b.essays.forEach(function (e) {
-    const r2 = eff(e);
-    const empty = isEmptyResult(r2);
-    const d = (r2 && r2.dimensions) || {};
-    const sc = (r2 && r2.score !== undefined && !empty) ? r2.score : null;
-    const gap = sc !== null ? scoreGap(r2) : 0;
-    html += '<tr><td><b>' + e.no + ' 号</b></td>' +
-      '<td><b>' + (sc !== null ? sc : '—') + '</b>' +
-      (gap !== 0 ? '<span class="badge bg-warn" style="margin-left:6px" title="四维合计 ' + dimTotal(r2) + ' 分，与总分差 ' + gap + ' 分">待核</span>' : '') +
-      '</td>' +
-      '<td>' + (sc !== null && r2.tier ? '<span class="badge ' + tierClass(sc) + '">' + esc(r2.tier) + '</span>' : '—') + '</td>' +
-      '<td>' + (!empty && d.content !== undefined ? d.content : '—') + '</td>' +
-      '<td>' + (!empty && d.language !== undefined ? d.language : '—') + '</td>' +
-      '<td>' + (!empty && d.structure !== undefined ? d.structure : '—') + '</td>' +
-      '<td>' + (!empty && d.handwriting !== undefined ? d.handwriting : '—') + '</td>' +
-      '<td>' + (!empty && r2 && r2.wordCount ? r2.wordCount : '—') + '</td>' +
-      '<td>' + (e.reviewed ? '<span class="badge bg-rev">已复核</span>'
-        : (empty ? '<span class="badge bg-err">空结果</span>'
-          : (e.status === 'done' ? '<span class="badge bg-done">AI 初评</span>'
-            : (e.status === 'error' ? '<span class="badge bg-err">失败</span>' : '<span class="badge bg-pend">未批改</span>')))) + '</td>' +
-      '<td class="wrapcell">' + esc((!empty && r2 && r2.problems ? r2.problems.join('；') : '') || '—') + '</td></tr>';
-  });
-  html += '</tbody>';
-  document.getElementById('scoreTable').innerHTML = html;
+  // 成绩明细已并进登分表（renderRoster 里点行展开），这里不再单独渲染一张表
   backfillIdentifiers(id).then(function (n) {
     if (n) {
       api('/api/batch/get', { id: id }).then(function (r2) {
@@ -1719,54 +2359,140 @@ function renderClassAnalysis(b) {
   box.innerHTML = h;
 }
 
+/* 展开区的成绩明细内容（与工作台展开行同一套紧凑形式）。
+   独立成「内容函数」是给两个壳共用：登分表的 rdet 行、工作台展开行（后者还要加操作按钮）。 */
+function rosterDetailInner(e, r) {
+  const has = r && !isEmptyResult(r);
+  const idf = e.identifier || {};
+  if (!has) {
+    return '<div class="note" style="margin:2px 0">尚未批改。</div>' +
+      '<div style="font-size:12.5px;line-height:1.9">标题：' + esc(idf.title || '未写标题') +
+      '　·　首句：' + esc(idf.firstSentence || '—') + '</div>';
+  }
+  const d = r.dimensions || {};
+  let h = '<div class="dims" style="margin:2px 0">' +
+    dimBox('内容', d.content, 10) + dimBox('语言', d.language, 10) +
+    dimBox('结构', d.structure, 3) + dimBox('书写', d.handwriting, 2) + '</div>';
+  if (r.wordCount) h += '<div style="font-size:12px;color:var(--ink2);margin:2px 0 6px">识别词数 ' + r.wordCount + ' 词</div>';
+  const gt = dimTotal(r);
+  const gp = scoreGap(r);
+  if (gt !== null && gp !== 0) {
+    h += '<div class="blk warn"><h5>得分口径待核对</h5>' +
+      '四维合计 <b>' + gt + '</b> 分，最终得分 <b>' + r.score + '</b> 分，差 <b>' + Math.abs(gp) + '</b> 分。' +
+      '要改分数，去批改工作台点「教师复核 / 修改」。</div>';
+  }
+  if (r.pointsDetail && r.pointsDetail.length) {
+    const miss = r.pointsDetail.filter((p) => !p.covered).length;
+    h += '<div class="blk points ' + (miss ? 'warn' : '') + '"><h5>要点核对　' +
+      (r.pointsDetail.length - miss) + ' / ' + r.pointsDetail.length + ' 已覆盖' +
+      (miss ? '　缺 ' + miss + ' 个 → 已降档' : '　全部覆盖') + '</h5><ul>' +
+      r.pointsDetail.map(function (p) {
+        return '<li><span class="mk ' + (p.covered ? 'y' : 'n') + '">' + (p.covered ? '✓' : '✗') + '</span>' +
+          '<span>' + esc(p.point) + (p.note ? '　<span class="nt">' + esc(p.note) + '</span>' : '') + '</span></li>';
+      }).join('') + '</ul></div>';
+  }
+  const eb = errorsBlock(e.ai && e.ai.errors);
+  if (eb) h += '<div style="max-height:230px;overflow:auto">' + eb + '</div>';
+  h += plagiarismBlock(e.ai && e.ai.plagiarism);
+  const duoA = [];
+  if (r.deductions && r.deductions.length) {
+    duoA.push('<div class="blk warn" style="flex:1;min-width:250px"><h5>硬性扣分</h5><ul>' +
+      r.deductions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>');
+  }
+  const tn = teacherNoteBlock(r.teacherNote);
+  if (tn) duoA.push('<div style="flex:1;min-width:250px">' + tn + '</div>');
+  if (duoA.length === 2) {
+    h += '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">' + duoA.join('') + '</div>';
+  } else if (duoA.length) h += duoA[0];
+  const duoB = [];
+  if (r.problems && r.problems.length) {
+    duoB.push('<div class="blk warn" style="flex:1;min-width:250px"><h5>核心问题</h5><ul>' +
+      r.problems.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>');
+  }
+  if (r.suggestions && r.suggestions.length) {
+    duoB.push('<div class="blk" style="flex:1;min-width:250px"><h5>改进建议</h5><ul>' +
+      r.suggestions.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>');
+  }
+  if (duoB.length === 2) {
+    h += '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">' + duoB.join('') + '</div>';
+  } else if (duoB.length) h += duoB[0];
+  if (r.comment) h += '<div class="blk"><h5>综合评语</h5><div class="ta">' + esc(r.comment) + '</div></div>';
+  if (r.transcription) h += '<div class="blk"><h5>识别原文</h5><div class="ta mono" style="max-height:190px;overflow:auto">' + esc(r.transcription) + '</div></div>';
+  return h;
+}
+
+/* 登分表展开行壳 */
+function rosterDetailRow(e, r) {
+  return '<tr class="rdet"><td></td><td colspan="9" ' +
+    'style="background:rgba(37,99,235,.05);padding:10px 14px;max-height:480px;overflow:auto">' +
+    rosterDetailInner(e, r) + '</td></tr>';
+}
+
+/* 登分表 / 工作台共用的「作文行」：勾选、编号、行内身份编辑、得分/档次/状态、原卷、展开箭头。
+   marksHtml 追加在状态列（工作台用它放雷同/抄袭小角标）。 */
+function essayRowHtml(e, b, marksHtml) {
+  const r = hasResult(e) ? eff(e) : null;
+  const idt = e.identity || {};
+  const src = (idt.source === 'manual' ? '教师填写'
+    : (idt.source === 'roster' ? '名单核定'
+      : (idt.source === 'filename' ? '文件名' : (idt.source === 'ai' ? '卷面识别' : ''))));
+  const box = (f, val, ph, w) => '<input type="text" class="rin' + (val ? ' filled' : '') +
+    '" data-rf="' + f + '" data-re="' + e.id + '" value="' + esc(val || '') +
+    '" placeholder="' + ph + '"' + (w ? ' style="min-width:' + w + '"' : '') + '>';
+  const ck = S.ck || (S.ck = new Set());
+  const open = S.rowOpen || (S.rowOpen = new Set());
+  return '<tr data-row="' + e.id + '" style="cursor:pointer">' +
+    '<td><input type="checkbox" class="rowck" data-ck="' + e.id + '"' + (ck.has(String(e.id)) ? ' checked' : '') + '></td>' +
+    '<td><b>' + e.no + ' 号</b></td>' +
+    '<td>' + box('name', idt.name, '点这里填') +
+      '<span class="saved" data-sv="' + e.id + '">已存</span>' +
+      (src ? '<div style="font-size:11px;color:var(--ink3);padding-left:7px">' + src + '</div>' : '') +
+      ((e.nameCandidates || []).length
+        ? '<div style="font-size:11px;padding-left:7px;line-height:1.7">候选：' +
+          e.nameCandidates.map(function (c) {
+            const nm = typeof c === 'string' ? c : c.name;
+            const from = (c && c.from) === 'roster' ? '名单' : ((c && c.from) === 'archive' ? '档案' : '卷面认出');
+            return '<a href="#" data-cand="' + esc(nm) + '" data-re="' + e.id + '" style="margin-right:7px" title="来自' + from + '">' +
+              esc(nm) + '<i style="font-style:normal;color:var(--ink3);font-size:10px">(' + from + ')</i></a>';
+          }).join('') + '</div>'
+        : '') + '</td>' +
+    '<td>' + box('className', idt.className, b.className || '—', '90px') + '</td>' +
+    '<td>' + box('seatNo', idt.seatNo, '—', '80px') + '</td>' +
+    '<td><b>' + (r && r.score !== undefined ? r.score : '—') + '</b>' +
+      (r && r.score !== undefined && scoreGap(r) !== 0
+        ? '<span class="badge bg-warn" style="margin-left:6px" title="四维合计 ' + dimTotal(r) + ' 分">待核</span>' : '') +
+    '</td>' +
+    '<td>' + (r && r.tier ? '<span class="badge ' + tierClass(r.score) + '">' + esc(r.tier) + '</span>' : '—') + '</td>' +
+    '<td>' + (e.reviewed ? '<span class="badge bg-rev">已复核</span>'
+      : (r ? '<span class="badge bg-done">AI 初评</span>' : '<span class="badge bg-pend">未批改</span>')) +
+      (marksHtml || '') + '</td>' +
+    '<td>' + (e.file
+      ? '<img class="paper-thumb" src="/uploads/' + esc(e.file) + '" data-zoom="/uploads/' + esc(e.file) +
+        '" data-cap="' + e.no + ' 号作文原卷" alt="' + e.no + ' 号原卷" title="点击查看 ' + e.no + ' 号作文原卷">'
+      : '<span style="color:var(--ink3)">—</span>') + '</td>' +
+    '<td style="color:var(--ink3);text-align:center">' + (open.has(String(e.id)) ? '▾' : '▸') + '</td></tr>';
+}
+
 function renderRoster(b) {
   const card = document.getElementById('rosterCard');
   if (!b.essays.length) { card.style.display = 'none'; return; }
   card.style.display = 'block';
-  fillClassBar(b);
+  fillClassBar('', b);
 
-  const head = ['编号', '姓名', '班级', '考号', '作文标题', '正文首句', '得分', '档次', '状态', '原卷'];
-  let html = '<thead><tr>' + head.map((h) => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>';
+  const head = ['编号', '姓名', '班级', '考号', '得分', '档次', '状态', '原卷'];
+  const ck = S.ck || (S.ck = new Set());
+  const open = S.rowOpen || (S.rowOpen = new Set());
+  let html = '<thead><tr><th style="width:26px"><input type="checkbox" id="ckHead" title="全选 / 全不选"></th>' +
+    head.map((h) => '<th>' + h + '</th>').join('') + '<th style="width:30px"></th></tr></thead><tbody>';
   b.essays.forEach(function (e) {
     const r = hasResult(e) ? eff(e) : null;
-    const idt = e.identity || {};
-    const idf = e.identifier || {};
-    const src = (idt.source === 'manual' ? '教师填写'
-      : (idt.source === 'roster' ? '名单核定'
-        : (idt.source === 'filename' ? '文件名' : (idt.source === 'ai' ? '卷面识别' : ''))));
-    const box = (f, val, ph, w) => '<input type="text" class="rin' + (val ? ' filled' : '') +
-      '" data-rf="' + f + '" data-re="' + e.id + '" value="' + esc(val || '') +
-      '" placeholder="' + ph + '"' + (w ? ' style="min-width:' + w + '"' : '') + '>';
-
-    html += '<tr data-row="' + e.id + '"><td><b>' + e.no + ' 号</b></td>' +
-      '<td>' + box('name', idt.name, '点这里填') +
-        '<span class="saved" data-sv="' + e.id + '">已存</span>' +
-        (src ? '<div style="font-size:11px;color:var(--ink3);padding-left:7px">' + src + '</div>' : '') +
-        ((e.nameCandidates || []).length
-          ? '<div style="font-size:11px;padding-left:7px;line-height:1.7">候选：' +
-            e.nameCandidates.map(function (c) {
-              return '<a href="#" data-cand="' + esc(c.name) + '" data-re="' + e.id + '" style="margin-right:7px">' +
-                esc(c.name) + '</a>';
-            }).join('') + '</div>'
-          : '') + '</td>' +
-      '<td>' + box('className', idt.className, b.className || '—', '90px') + '</td>' +
-      '<td>' + box('seatNo', idt.seatNo, '—', '80px') + '</td>' +
-      '<td class="wrapcell">' + esc(idf.title || '未写标题') + '</td>' +
-      '<td class="wrapcell" style="color:var(--ink2)">' + esc((idf.firstSentence || '—').slice(0, 60)) + '</td>' +
-      '<td><b>' + (r && r.score !== undefined ? r.score : '—') + '</b>' +
-      (r && r.score !== undefined && scoreGap(r) !== 0
-        ? '<span class="badge bg-warn" style="margin-left:6px" title="四维合计 ' + dimTotal(r) + ' 分">待核</span>' : '') +
-      '</td>' +
-      '<td>' + (r && r.tier ? '<span class="badge ' + tierClass(r.score) + '">' + esc(r.tier) + '</span>' : '—') + '</td>' +
-      '<td>' + (e.reviewed ? '<span class="badge bg-rev">已复核</span>'
-        : (r ? '<span class="badge bg-done">AI 初评</span>' : '<span class="badge bg-pend">未批改</span>')) + '</td>' +
-      '<td>' + (e.file
-        ? '<img class="paper-thumb" src="/uploads/' + esc(e.file) + '" data-zoom="/uploads/' + esc(e.file) +
-          '" data-cap="' + e.no + ' 号作文原卷" alt="' + e.no + ' 号原卷" title="点击查看 ' + e.no + ' 号作文原卷">'
-        : '<span style="color:var(--ink3)">—</span>') + '</td></tr>';
+    html += essayRowHtml(e, b);
+    if (open.has(String(e.id))) html += rosterDetailRow(e, r);
   });
   html += '</tbody>';
   document.getElementById('rosterTable').innerHTML = html;
+  const hc = document.getElementById('ckHead');
+  if (hc) hc.checked = b.essays.length > 0 && b.essays.every((e) => ck.has(String(e.id)));
 }
 
 /* ---- 一键填写班级：一个批次里混了几个班的卷子时批量补 ---- */
@@ -1787,36 +2513,109 @@ function refreshClassOptions() {
   document.getElementById('clsOptions').innerHTML =
     knownClasses().map(function (c) { return '<option value="' + esc(c) + '"></option>'; }).join('');
 }
-function fillClassBar(b) {
+/* p = 工具行前缀：登分表是 ''（index.html 里的静态元素），工作台表格是 'wb'（随表格注入） */
+function fillClassBar(p, b) {
   refreshClassOptions();
-  const input = document.getElementById('clsFillInput');
-  if (!input.value) input.value = (b && b.className) || '';
-  const blank = (b.essays || []).filter(function (e) {
+  const input = document.getElementById(p + 'clsFillInput');
+  if (input && !input.value) input.value = (b && b.className) || '';
+  // 勾选只在当前批次内生效，切批次时清掉别的批次残留下的勾
+  const ck = S.ck || (S.ck = new Set());
+  const ids = new Set(((b && b.essays) || []).map((e) => String(e.id)));
+  Array.from(ck).forEach(function (id) { if (!ids.has(id)) ck.delete(id); });
+  const blank = ((b && b.essays) || []).filter(function (e) {
     return !String((e.identity || {}).className || '').trim();
   }).length;
-  document.getElementById('clsFillHint').textContent = blank
+  const hint = document.getElementById(p + 'clsFillHint');
+  if (hint) hint.textContent = blank
     ? '这一批还有 ' + blank + ' 篇没填班级'
     : '这一批每篇都已有班级';
-  document.getElementById('btnFillClassBlank').disabled = !blank;
+  updateClsFillCount(p);
 }
-async function fillClass(mode) {
-  const id = S.recordBatch || (S.current && S.current.id);
+/* 「填到勾选的 N 篇」按钮上的计数（登分表与工作台两份都刷新） */
+function updateClsFillCount(p) {
+  const prefixes = p ? [p] : ['', 'wb'];
+  prefixes.forEach(function (q) {
+    const b = q === 'wb' ? S.current : (S.recordData || S.current);
+    const ck = S.ck || (S.ck = new Set());
+    const n = ((b && b.essays) || []).filter(function (e) { return ck.has(String(e.id)); }).length;
+    const btn = document.getElementById(q + 'btnFillClassSelected');
+    if (btn) btn.disabled = !n;
+    const cnt = document.getElementById(q + 'clsFillCount');
+    if (cnt) cnt.textContent = n;
+  });
+}
+/* 勾选辅助：blankOnly = 只勾班级空白的；false = 全勾 */
+function selectRows(p, blankOnly) {
+  const b = p === 'wb' ? S.current : (S.recordData || S.current);
+  if (!b || !b.essays) return;
+  const ck = S.ck || (S.ck = new Set());
+  b.essays.forEach(function (e) {
+    const blank = !String((e.identity || {}).className || '').trim();
+    if (!blankOnly || blank) ck.add(String(e.id));
+  });
+  if (p === 'wb') renderEssays(); else renderRoster(b);
+}
+async function fillClass(p) {
+  const id = p === 'wb' ? (S.current && S.current.id) : (S.recordBatch || (S.current && S.current.id));
   if (!id) { alert('请先选择一个批次'); return; }
-  const cls = document.getElementById('clsFillInput').value.trim();
+  const cls = document.getElementById((p || '') + 'clsFillInput').value.trim();
   if (!cls) { alert('请先填写班级名称'); return; }
-  if (mode === 'all') {
-    const n = (S.recordData && S.recordData.id === id) ? S.recordData.essays.length : '';
-    if (!confirm('把这一批' + (n ? '全部 ' + n + ' 篇' : '每一篇') + '的班级都改成「' + cls + '」？\n\n' +
-      '已经识别出来的班级也会被覆盖。之后重新批改时，如果卷面上识别到班级，仍会以识别结果为准。')) return;
-  }
-  const r = await api('/api/class/fill', { batchId: id, className: cls, mode: mode });
+  const ck = S.ck || (S.ck = new Set());
+  const ids = Array.from(ck);
+  if (!ids.length) { alert('还没有勾选任何一篇：在表的第一列勾上要填的作文，或点「选空白 / 全选」。'); return; }
+  const r = await api('/api/class/fill', { batchId: id, className: cls, mode: 'selected', essayIds: ids });
   if (!r.ok) { alert('填写失败：' + r.error); return; }
-  if (!r.filled) { alert('没有需要填写的作文。'); return; }
-  await renderRecords();
+  alert(r.filled
+    ? '已把「' + cls + '」填到勾选的 ' + r.filled + ' 篇。'
+    : '勾选的篇目班级本来就已经是「' + cls + '」，没有需要改动的。');
+  S.ck.clear();
+  if (S.recordData && S.recordData.id === id) await renderRecords();
   if (S.current && S.current.id === id) { await refreshCurrent(); renderWorkbench(); }
 }
-document.getElementById('btnFillClassBlank').addEventListener('click', function () { fillClass('blank'); });
-document.getElementById('btnFillClassAll').addEventListener('click', function () { fillClass('all'); });
+document.getElementById('btnFillClassSelected').addEventListener('click', function () { fillClass(''); });
+document.getElementById('ckBlank').addEventListener('click', function () { selectRows('', true); });
+document.getElementById('ckAll').addEventListener('click', function () { selectRows('', false); });
+document.getElementById('ckNone').addEventListener('click', function () {
+  (S.ck || (S.ck = new Set())).clear();
+  const b = S.recordData || S.current;
+  if (S.current) renderEssays();
+  if (b && b.essays) renderRoster(b);
+});
+
+/* 登分表行内勾选框：维护 S.ck 并刷新计数（不整表重画，不打断输入） */
+document.getElementById('rosterTable').addEventListener('change', function (ev) {
+  const el = ev.target;
+  const ck = S.ck || (S.ck = new Set());
+  if (el.id === 'ckHead') {
+    if (el.checked) selectRows(false);
+    else {
+      ck.clear();
+      const b = S.recordData || S.current;
+      if (b && b.essays) renderRoster(b); else updateClsFillCount();
+    }
+    return;
+  }
+  if (!el.classList || !el.classList.contains('rowck')) return;
+  const id = el.getAttribute('data-ck');
+  if (el.checked) ck.add(String(id)); else ck.delete(String(id));
+  updateClsFillCount();
+  const hc = document.getElementById('ckHead');
+  if (hc) {
+    const b = S.recordData || S.current;
+    hc.checked = !!b && b.essays.length > 0 && b.essays.every((e) => ck.has(String(e.id)));
+  }
+});
+
+/* 点行（输入框 / 候选 / 缩略图 / 勾选框以外的地方）→ 展开或收起这一篇的成绩明细 */
+document.getElementById('rosterTable').addEventListener('click', function (ev) {
+  if (ev.target.closest('input, a, button, img, .rin')) return;
+  const tr = ev.target.closest('tr[data-row]');
+  if (!tr) return;
+  const id = String(tr.getAttribute('data-row'));
+  const open = S.rowOpen || (S.rowOpen = new Set());
+  if (open.has(id)) open.delete(id); else open.add(id);
+  renderRoster(S.recordData || S.current);
+});
 
 /* 生成 / 重新生成班级共性分析 */
 document.getElementById('classAi').addEventListener('click', async function (ev) {
@@ -1837,13 +2636,16 @@ document.getElementById('classAi').addEventListener('click', async function (ev)
   await renderRecords();
 });
 
-/* 保存登分表某一行（三个字段一起提交，因为接口是整体覆盖） */
-async function saveRosterRow(essayId) {
-  const row = document.querySelector('#rosterTable tr[data-row="' + essayId + '"]');
+/* 保存表格某一行（三个字段一起提交，因为接口是整体覆盖）。
+   tableSel：'#rosterTable'（登分表）或 '#wbTable'（工作台表格），同一篇可能在两张表里。 */
+async function saveRosterRow(essayId, tableSel) {
+  const row = document.querySelector((tableSel || '#rosterTable') + ' tr[data-row="' + essayId + '"]');
   if (!row) return;
   const val = (f) => { const el = row.querySelector('[data-rf="' + f + '"]'); return el ? el.value.trim() : ''; };
   const identity = { name: val('name'), className: val('className'), seatNo: val('seatNo') };
-  const batchId = S.recordBatch || (S.current && S.current.id);
+  const batchId = (tableSel === '#wbTable')
+    ? (S.current && S.current.id)
+    : (S.recordBatch || (S.current && S.current.id));
   if (!batchId) return;
   const res = await api('/api/identity', { batchId: batchId, essayId: essayId, identity: identity });
   if (!res.ok) { alert('保存失败：' + res.error); return; }
@@ -1856,6 +2658,9 @@ async function saveRosterRow(essayId) {
   };
   apply(S.recordData);
   apply(S.current);
+
+  // 班级可能改了：顶栏下拉框、历史批次列表旁的班级名跟着刷新（异步，不重画登分表、不打断输入）
+  refreshSummaries();
 
   row.querySelectorAll('.rin').forEach(function (el) {
     if (el.value.trim()) el.classList.add('filled'); else el.classList.remove('filled');
@@ -1871,7 +2676,8 @@ document.getElementById('rosterTable').addEventListener('keydown', function (ev)
   if (ev.key === 'Enter') {
     ev.preventDefault();
     el.blur();
-    const rows = Array.prototype.slice.call(document.querySelectorAll('#rosterTable tbody tr'));
+    // 只跳主行（tr[data-row]）：展开出来的成绩明细行不是登分行，跳过
+    const rows = Array.prototype.slice.call(document.querySelectorAll('#rosterTable tbody tr[data-row]'));
     const idx = rows.indexOf(el.closest('tr'));
     const next = rows[idx + 1];
     if (next) {
@@ -2107,8 +2913,13 @@ function renderClassList() {
       '<b>' + esc(c.className) + '</b>' +
       '<span>' + c.students + ' 名学生 · ' + c.essays + ' 篇</span>' +
       '<span>平均 ' + (c.avg === null ? '—' : c.avg + ' 分') +
-      (c.unnamed ? '　·　' + c.unnamed + ' 篇未归名' : '') + '</span></div>';
+      (c.unnamed ? '　·　' + c.unnamed + ' 篇未归名' : '') + '</span>' +
+      // 「（未填班级）」是未归名作文的汇总桶，不是真实班级，不给删除按钮
+      (c.className === '（未填班级）' ? '' :
+        '<i class="clx" data-cldel="' + esc(c.className) + '" title="删除该班级（连学生档案与名下作文一起删）">✕</i>') + '</div>';
   });
+  html += '<div class="chip add" data-cladd="1" title="新建一个空班级，名单稍后贴或用花名册导入">' +
+    '<b>＋ 添加班级</b></div>';
   html += '</div>';
   all.innerHTML = html;
 }
@@ -2121,41 +2932,202 @@ function filteredStudents() {
   });
 }
 
+/* 当前选中班级下的「未归名作文」（没有姓名、游离在档案之外的篇目） */
+function currentUnnamedEssays() {
+  const r = S.archive;
+  if (!r || !r.classes) return [];
+  if (S.archClass) {
+    const c = r.classes.find(function (x) { return x.className === S.archClass; });
+    return (c && c.unnamedEssays) ? c.unnamedEssays : [];
+  }
+  const all = [];
+  r.classes.forEach(function (c) { if (c.unnamedEssays) all.push.apply(all, c.unnamedEssays); });
+  return all;
+}
+
+/* 未归名作文区块：可勾选、补姓名归入档案、删除——与正常学生一样管理 */
+function unnamedEssaysBlock(list) {
+  const ck = S.unCk || (S.unCk = new Set());
+  let h = '<div class="blk" style="margin-top:14px"><h5>未归名作文 · ' + list.length + ' 篇</h5>' +
+    '<div class="hint" style="font-size:12.5px;line-height:1.8">这些作文还没识别到姓名，所以没进任何学生档案。' +
+    '在「姓名」栏补上姓名（班级 / 考号可改），失焦后自动归入档案；勾选后可以批量删除。</div>' +
+    '<div class="row" style="margin:8px 0">' +
+      '<a href="javascript:void(0)" data-uall style="font-size:12px;margin-right:10px">全选</a>' +
+      '<a href="javascript:void(0)" data-unone style="font-size:12px;margin-right:14px">全不选</a>' +
+      '<button class="btn sm danger" data-udelbatch' + (ck.size ? '' : ' disabled') + '>删除勾选的 <span data-ucnt>' + ck.size + '</span> 篇</button>' +
+    '</div>' +
+    '<div class="tbl-wrap"><table><thead><tr>' +
+    '<th style="width:26px"></th><th>编号</th><th>批次</th><th>作文标题</th><th>正文首句</th><th>姓名</th><th>班级</th><th>考号</th><th>得分</th><th>状态</th><th>原卷</th><th></th>' +
+    '</tr></thead><tbody>';
+  list.forEach(function (u) {
+    const hasSc = u.score !== null && u.score !== undefined;
+    const sc = hasSc ? u.score : '—';
+    const st = u.reviewed ? '<span class="badge bg-rev">已复核</span>'
+      : (u.status === 'done' ? '<span class="badge bg-done">AI 初评</span>'
+        : (u.status === 'error' ? '<span class="badge bg-err">失败</span>' : '<span class="badge bg-pend">未批改</span>'));
+    h += '<tr data-una="' + u.essayId + '" data-ubid="' + u.batchId + '">' +
+      '<td><input type="checkbox" class="unck" data-unck="' + u.essayId + '"' + (ck.has(u.essayId) ? ' checked' : '') + '></td>' +
+      '<td><b>' + u.no + ' 号</b></td>' +
+      '<td class="wrapcell">' + esc(u.batchTitle || '—') + '</td>' +
+      '<td class="wrapcell">' + esc(u.title || '未写标题') + '</td>' +
+      '<td class="wrapcell" style="color:var(--ink2)">' + esc((u.firstSentence || '—').slice(0, 40)) + '</td>' +
+      '<td><input type="text" class="uname" data-uf="name" placeholder="补姓名" style="min-width:72px"></td>' +
+      '<td><input type="text" class="uname" data-uf="className" value="' + esc(u.className || '') + '" placeholder="班级" style="min-width:72px"></td>' +
+      '<td><input type="text" class="uname" data-uf="seatNo" value="' + esc(u.seatNo || '') + '" placeholder="考号" style="min-width:56px"></td>' +
+      '<td><b>' + sc + '</b>' + (hasSc && u.tier ? ' <span class="badge ' + tierClass(u.score) + '">' + esc(u.tier) + '</span>' : '') + '</td>' +
+      '<td>' + st + '</td>' +
+      '<td>' + (u.file
+        ? '<img class="paper-thumb" src="/uploads/' + esc(u.file) + '" data-zoom="/uploads/' + esc(u.file) +
+          '" data-cap="' + u.no + ' 号作文原卷" alt="原卷" title="点击查看原卷">'
+        : '<span style="color:var(--ink3)">—</span>') + '</td>' +
+      '<td><button class="btn sm ghost" data-udel="' + u.essayId + '" data-un="' + u.no + '">删除</button></td>' +
+      '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+/* 补姓名把未归名作文归入档案（填了姓名才归；班级/考号随行提交） */
+async function saveUnnamedRow(essayId) {
+  const row = document.querySelector('#stuList tr[data-una="' + essayId + '"]');
+  if (!row) return;
+  const bid = row.getAttribute('data-ubid');
+  const val = function (f) { const el = row.querySelector('[data-uf="' + f + '"]'); return el ? el.value.trim() : ''; };
+  const name = val('name');
+  if (!name) return;
+  const r = await api('/api/identity', {
+    batchId: bid, essayId: essayId,
+    identity: { name: name, className: val('className'), seatNo: val('seatNo') }
+  });
+  if (!r.ok) { alert('归入档案失败：' + r.error); return; }
+  (S.unCk || (S.unCk = new Set())).delete(essayId);
+  await renderArchive();
+}
+
+function updateUnCk() {
+  const ck = S.unCk || (S.unCk = new Set());
+  const cnt = document.querySelector('#stuList [data-ucnt]');
+  if (cnt) cnt.textContent = ck.size;
+  const btn = document.querySelector('#stuList [data-udelbatch]');
+  if (btn) btn.disabled = !ck.size;
+}
+
+async function deleteUnnamedOne(essayId, no) {
+  if (!confirm('删除 ' + no + ' 号作文（含照片与批改结果）？此操作不可恢复。')) return;
+  const u = currentUnnamedEssays().find(function (x) { return x.essayId === essayId; });
+  if (!u) return;
+  const r = await api('/api/essay/delete', { batchId: u.batchId, essayId: essayId });
+  if (!r.ok) { alert('删除失败：' + r.error); return; }
+  (S.unCk || (S.unCk = new Set())).delete(essayId);
+  await renderArchive();
+}
+
+async function deleteUnnamedBatch() {
+  const ck = S.unCk || (S.unCk = new Set());
+  const picked = currentUnnamedEssays().filter(function (u) { return ck.has(u.essayId); });
+  if (!picked.length) { alert('还没有勾选任何作文。'); return; }
+  if (!confirm('删除勾选的 ' + picked.length + ' 篇作文（含照片与批改结果）？此操作不可恢复。')) return;
+  let ok = 0, fail = 0;
+  for (const u of picked) {
+    const r = await api('/api/essay/delete', { batchId: u.batchId, essayId: u.essayId });
+    if (r.ok) ok++; else fail++;
+  }
+  ck.clear();
+  await renderArchive();
+  alert('已删除 ' + ok + ' 篇' + (fail ? '，失败 ' + fail + ' 篇' : '') + '。');
+}
+
+/* 未归名作文：全选 / 全不选 / 单删 / 批量删 */
+document.getElementById('stuList').addEventListener('click', async function (ev) {
+  const t = ev.target;
+  const batch = t.closest('[data-udelbatch]');
+  if (batch) { deleteUnnamedBatch(); return; }
+  const all = t.closest('[data-uall]');
+  if (all) {
+    const ck = S.unCk || (S.unCk = new Set());
+    currentUnnamedEssays().forEach(function (u) { ck.add(u.essayId); });
+    renderStudentList();
+    return;
+  }
+  const none = t.closest('[data-unone]');
+  if (none) {
+    (S.unCk || (S.unCk = new Set())).clear();
+    renderStudentList();
+    return;
+  }
+  const del = t.closest('[data-udel]');
+  if (del) { deleteUnnamedOne(del.getAttribute('data-udel'), del.getAttribute('data-un')); return; }
+});
+
+/* 未归名作文勾选 */
+document.getElementById('stuList').addEventListener('change', function (ev) {
+  const el = ev.target;
+  if (!el.classList || !el.classList.contains('unck')) return;
+  const ck = S.unCk || (S.unCk = new Set());
+  const id = el.getAttribute('data-unck');
+  if (el.checked) ck.add(id); else ck.delete(id);
+  updateUnCk();
+});
+
+/* 未归名作文补姓名：失焦即保存归入档案 */
+document.getElementById('stuList').addEventListener('focusout', function (ev) {
+  const el = ev.target;
+  if (!el.classList || !el.classList.contains('uname')) return;
+  const row = el.closest('tr[data-una]');
+  if (!row) return;
+  const nameEl = row.querySelector('[data-uf="name"]');
+  if (!nameEl || !nameEl.value.trim()) return;
+  saveUnnamedRow(row.getAttribute('data-una'));
+});
+
 function renderStudentList() {
   const box = document.getElementById('stuList');
   const list = filteredStudents();
   document.getElementById('stuSub').textContent = list.length + ' 名学生' +
     (S.archClass ? ' · ' + S.archClass : '');
+  updateStuCkBar();
 
-  if (!list.length) {
-    box.innerHTML = '<div class="empty"><div class="ic">👤</div>还没有归档的学生<br>批改时若识别到卷面姓名，或你在登分表里填了姓名，这里就会自动建立档案</div>';
+  const unnamed = currentUnnamedEssays();
+  if (!list.length && !unnamed.length) {
+    box.innerHTML = '<div class="empty"><div class="ic">' + icon('user', 34) +
+      '</div>还没有归档的学生<br>批改时若识别到卷面姓名，或你在登分表里填了姓名，这里就会自动建立档案</div>';
     return;
   }
 
-  let html = '<div class="tbl-wrap"><table>' +
-    '<thead><tr><th>姓名</th><th>班级</th><th>学号</th><th>作文次数</th><th>平均分</th><th>最高</th><th>最低</th><th>最近一次</th><th>较上次</th></tr></thead><tbody>';
-  list.forEach(function (s) {
-    let d = '<span class="delta flat">—</span>';
-    if (s.delta !== null && s.delta !== undefined) {
-      if (s.delta > 0) d = '<span class="delta up">↑ ' + s.delta + '</span>';
-      else if (s.delta < 0) d = '<span class="delta down">↓ ' + Math.abs(s.delta) + '</span>';
-      else d = '<span class="delta flat">持平</span>';
-    }
-    const last = s.last;
-    html += '<tr data-stu="' + s.id + '" style="cursor:pointer">' +
-      '<td><b>' + esc(s.name) + '</b></td>' +
-      '<td>' + esc(s.className || '—') + '</td>' +
-      '<td>' + esc(s.seatNo || '—') + '</td>' +
-      '<td>' + s.records.length + ' 次</td>' +
-      '<td><b>' + (s.avg === null ? '—' : s.avg) + '</b></td>' +
-      '<td>' + (s.best === null ? '—' : s.best) + '</td>' +
-      '<td>' + (s.worst === null ? '—' : s.worst) + '</td>' +
-      '<td class="wrapcell">' + (last
-        ? esc((last.batchTitle || '').slice(0, 14)) + '　' + (last.score === null ? '未批改' : last.score + ' 分')
-        : '—') + '</td>' +
-      '<td>' + d + '</td></tr>';
-  });
-  html += '</tbody></table></div>';
+  let html = '';
+  if (list.length) {
+    html += '<div class="tbl-wrap"><table>' +
+      '<thead><tr><th style="width:26px"></th><th>姓名</th><th>班级</th><th>学号</th><th>作文次数</th><th>平均分</th><th>最高</th><th>最低</th><th>最近一次</th><th>较上次</th><th>操作</th></tr></thead><tbody>';
+    const ck = S.stuCk || (S.stuCk = new Set());
+    list.forEach(function (s) {
+      let d = '<span class="delta flat">—</span>';
+      if (s.delta !== null && s.delta !== undefined) {
+        if (s.delta > 0) d = '<span class="delta up">↑ ' + s.delta + '</span>';
+        else if (s.delta < 0) d = '<span class="delta down">↓ ' + Math.abs(s.delta) + '</span>';
+        else d = '<span class="delta flat">持平</span>';
+      }
+      const last = s.last;
+      html += '<tr data-stu="' + s.id + '" style="cursor:pointer">' +
+        '<td><input type="checkbox" class="stuck" data-stuck="' + s.id + '"' + (ck.has(s.id) ? ' checked' : '') + '></td>' +
+        '<td><b>' + esc(s.name) + '</b></td>' +
+        '<td>' + esc(s.className || '—') + '</td>' +
+        '<td>' + esc(s.seatNo || '—') + '</td>' +
+        '<td>' + s.records.length + ' 次</td>' +
+        '<td><b>' + (s.avg === null ? '—' : s.avg) + '</b></td>' +
+        '<td>' + (s.best === null ? '—' : s.best) + '</td>' +
+        '<td>' + (s.worst === null ? '—' : s.worst) + '</td>' +
+        '<td class="wrapcell">' + (last
+          ? esc((last.batchTitle || '').slice(0, 14)) + '　' + (last.score === null ? '未批改' : last.score + ' 分')
+          : '—') + '</td>' +
+        '<td>' + d + '</td>' +
+        '<td style="white-space:nowrap">' +
+          '<button class="btn sm ghost" data-stuedit="' + s.id + '">编辑</button> ' +
+          '<button class="btn sm ghost" data-studel="' + s.id + '" data-stun="' + esc(s.name) + '" data-sturc="' + s.records.length + '">删除</button>' +
+        '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+  if (unnamed.length) html += unnamedEssaysBlock(unnamed);
   box.innerHTML = html;
 }
 
@@ -2175,7 +3147,8 @@ async function renderStudentDetail(id) {
     '<div><label class="lb">姓名</label><input type="text" id="stName" value="' + esc(s.name) + '"></div>' +
     '<div><label class="lb">班级</label><input type="text" id="stClass" value="' + esc(s.className || '') + '"></div>' +
     '<div><label class="lb">学号</label><input type="text" id="stNo" value="' + esc(s.seatNo || '') + '"></div>' +
-    '<div style="flex:0 0 auto;min-width:0"><button class="btn sm" id="btnSaveStu" data-sid="' + s.id + '">保存并同步到所有作文</button></div>' +
+    '<div style="flex:0 0 auto;min-width:0"><button class="btn sm" id="btnSaveStu" data-sid="' + s.id + '">保存并同步到所有作文</button>' +
+    ' <button class="btn sm ghost" id="btnDelStu" data-sid="' + s.id + '" data-stun="' + esc(s.name) + '" data-sturc="' + recs.length + '">删除该学生</button></div>' +
     '</div>';
   h += '<div class="hint">改名或改班级后，这名学生已有的 ' + recs.length + ' 次记录会一起更新。若改名后与另一位学生重名同班，两人会被合并。</div>';
 
@@ -2292,7 +3265,38 @@ function openRecDetail(rec) {
   document.getElementById('recModal').classList.add('on');
 }
 
-document.getElementById('classList').addEventListener('click', function (ev) {
+document.getElementById('classList').addEventListener('click', async function (ev) {
+  // 添加班级
+  const add = ev.target.closest('[data-cladd]');
+  if (add) {
+    ev.stopPropagation();
+    const name = prompt('新班级名称（如 九(9)）：');
+    if (!name || !name.trim()) return;
+    const r = await api('/api/class/add', { className: name.trim() });
+    if (!r.ok) { alert('添加失败：' + r.error); return; }
+    if (r.existed) alert('这个班已经存在。');
+    await renderArchive();
+    return;
+  }
+  // 删除班级：连学生档案与名下作文一起删
+  const del = ev.target.closest('[data-cldel]');
+  if (del) {
+    ev.stopPropagation();
+    const className = del.getAttribute('data-cldel');
+    const c = ((S.archive && S.archive.classes) || []).find(function (x) { return x.className === className; }) || {};
+    if (!confirm('删除班级「' + className + '」？\n\n' +
+      '该班的名单、' + (c.students || 0) + ' 名学生档案、名下 ' + (c.essays || 0) + ' 篇作文（含照片与批改结果）会一并删除，' +
+      '按批次默认班级归入该班、还没识别出班级的作文也会删掉，批次上的默认班级同时清空，这个班之后不会再出现。\n' +
+      '此操作不可撤销（删除前会自动留一份数据快照兜底）。')) return;
+    const r = await api('/api/class/delete', { className: className, expectedStudents: c.students || 0 });
+    if (!r.ok) { alert('删除失败：' + r.error); return; }
+    alert('已删除：' + r.deletedStudents + ' 名学生、' + r.removedEssays + ' 篇作文' +
+      (r.clearedBatches ? '，' + r.clearedBatches + ' 个批次的默认班级已清空' : '') + '。');
+    if (S.archClass === className) S.archClass = '';
+    document.getElementById('stuDetail').style.display = 'none';
+    await renderArchive();
+    return;
+  }
   const c = ev.target.closest('[data-cls]');
   if (!c) return;
   S.archClass = c.dataset.cls;
@@ -2302,10 +3306,184 @@ document.getElementById('classList').addEventListener('click', function (ev) {
 });
 
 document.getElementById('stuList').addEventListener('click', function (ev) {
+  const img = ev.target.closest('.paper-thumb');
+  if (img) {
+    ev.preventDefault();
+    document.getElementById('modalImg').src = img.getAttribute('data-zoom');
+    document.getElementById('modalCap').textContent = img.getAttribute('data-cap') || '作文原图';
+    document.getElementById('modal').classList.add('on');
+    return;
+  }
+  const del = ev.target.closest('[data-studel]');
+  if (del) { deleteStudent(del.dataset.studel, del.dataset.stun, Number(del.dataset.sturc || 0)); return; }
+  const edit = ev.target.closest('[data-stuedit]');
+  if (edit) {
+    renderStudentDetail(edit.dataset.stuedit).then(function () {
+      const el = document.getElementById('stName');
+      if (el) { el.focus(); el.select(); }
+    });
+    return;
+  }
+  if (ev.target.closest('input, a')) return;   // 勾选框不触发行点击
   const tr = ev.target.closest('[data-stu]');
   if (!tr) return;
   renderStudentDetail(tr.dataset.stu);
 });
+
+/* 行内勾选框 → 维护勾选集合并刷新「删除勾选的 N 名」计数 */
+document.getElementById('stuList').addEventListener('change', function (ev) {
+  const el = ev.target;
+  if (!el.classList || !el.classList.contains('stuck')) return;
+  const ck = S.stuCk || (S.stuCk = new Set());
+  if (el.checked) ck.add(el.getAttribute('data-stuck'));
+  else ck.delete(el.getAttribute('data-stuck'));
+  updateStuCkBar();
+});
+
+function updateStuCkBar() {
+  const ck = S.stuCk || (S.stuCk = new Set());
+  const n = filteredStudents().filter(function (s) { return ck.has(s.id); }).length;
+  const c = document.getElementById('stuCkCount');
+  if (c) c.textContent = n;
+  const b = document.getElementById('btnStuDelBatch');
+  if (b) b.disabled = !n;
+}
+
+/* 批量添加学生（还没有作文的学生先建档） */
+/* ---------- 花名册 Excel 导入：文件 → AI 识别（格式不固定）→ 预览确认 → 建班+建档 ---------- */
+document.getElementById('btnRosterImport').addEventListener('click', function () {
+  document.getElementById('rosterFile').value = '';
+  document.getElementById('rosterFile').click();
+});
+document.getElementById('rosterFile').addEventListener('change', async function () {
+  const f = this.files && this.files[0];
+  if (!f) return;
+  if (!S.settings.hasKey) {
+    alert('花名册识别要用一次 AI（只读文字、不花什么钱）：请先到「设置」配好接口再导入。');
+    return;
+  }
+  const dataBase64 = await new Promise(function (resolve) {
+    const fr = new FileReader();
+    fr.onload = function () { resolve(String(fr.result).split(',')[1] || ''); };
+    fr.readAsDataURL(f);
+  });
+  const body = document.getElementById('recBody');
+  body.innerHTML = '<h5 style="margin:0 0 6px">正在识别「' + esc(f.name) + '」…</h5>' +
+    '<div class="hint">AI 正在从文件里辨认班级、姓名和学号（不需要固定格式），一般十几秒。</div>';
+  document.getElementById('recCap').textContent = '导入花名册';
+  document.getElementById('recModal').classList.add('on');
+  const r = await api('/api/roster/import-preview', { name: f.name, dataBase64: dataBase64 });
+  if (!r.ok) {
+    body.innerHTML = '<h5 style="margin:0 0 6px">识别失败</h5><div class="err">' + esc(r.error || '未知错误') + '</div>' +
+      '<div class="btn-row" style="margin-top:12px"><button class="btn ghost" id="riClose">关闭</button></div>';
+    document.getElementById('riClose').addEventListener('click', function () {
+      document.getElementById('recModal').classList.remove('on');
+    });
+    return;
+  }
+  let html = '<h5 style="margin:0 0 6px">识别结果　<span style="font-weight:400;color:var(--ink3);font-size:13px">' +
+    r.groups.length + ' 个班 · 共 ' + r.groups.reduce(function (a, g) { return a + g.students.length; }, 0) +
+    ' 名学生</span></h5>' +
+    '<div class="hint">核对一下，把不要的班去掉勾，点「导入」会：①存为班级名单 ②建学生档案（之后批改到作文自动并入）。</div>';
+  r.groups.forEach(function (g, i) {
+    html += '<div class="blk" style="margin-top:10px"><label style="display:flex;gap:8px;align-items:center">' +
+      '<input type="checkbox" class="riG" data-ri="' + i + '" checked><b>' + esc(g.className) + '</b>' +
+      '<span style="color:var(--ink3)">' + g.students.length + ' 人</span></label>' +
+      '<div style="font-size:12.5px;color:var(--ink2);margin-top:4px;line-height:1.8">' +
+      g.students.slice(0, 6).map(function (s) { return esc((s.seatNo ? s.seatNo + ' ' : '') + s.name); }).join('　·　') +
+      (g.students.length > 6 ? '　…' : '') + '</div></div>';
+  });
+  html += '<div class="btn-row" style="margin-top:12px">' +
+    '<button class="btn orange" id="riGo">导入勾选的班级</button>' +
+    '<button class="btn ghost" id="riClose">取消</button>' +
+    '<span class="hint" id="riHint"></span></div>';
+  body.innerHTML = html;
+  document.getElementById('riClose').addEventListener('click', function () {
+    document.getElementById('recModal').classList.remove('on');
+  });
+  document.getElementById('riGo').addEventListener('click', async function () {
+    const picked = Array.prototype.map.call(document.querySelectorAll('.riG'), function (el) {
+      return el.checked ? Number(el.getAttribute('data-ri')) : -1;
+    }).filter(function (i) { return i >= 0; });
+    if (!picked.length) { alert('至少勾选一个班。'); return; }
+    this.disabled = true;
+    const res = await api('/api/roster/import-apply', { groups: picked.map(function (i) { return r.groups[i]; }) });
+    this.disabled = false;
+    if (!res.ok) { alert('导入失败：' + res.error); return; }
+    document.getElementById('recModal').classList.remove('on');
+    alert('导入完成：' + res.classes.join('、') + '。\n新建档案 ' + res.added + ' 名' +
+      (res.merged ? '，已存在的 ' + res.merged + ' 名只补了空着的学号' : '') + '。');
+    await renderArchive();
+  });
+});
+
+document.getElementById('btnStuAdd').addEventListener('click', function () {
+  const box = document.getElementById('stuAddBox');
+  const show = box.style.display === 'none';
+  box.style.display = show ? 'block' : 'none';
+  if (show) {
+    const cls = document.getElementById('stuAddClass');
+    if (!cls.value && S.archClass && S.archClass !== '__all') cls.value = S.archClass;
+    document.getElementById('stuAddText').focus();
+  }
+});
+document.getElementById('btnStuAddCancel').addEventListener('click', function () {
+  document.getElementById('stuAddBox').style.display = 'none';
+});
+document.getElementById('btnStuAddGo').addEventListener('click', async function () {
+  const className = document.getElementById('stuAddClass').value.trim();
+  const text = document.getElementById('stuAddText').value.trim();
+  if (!text) { alert('请先把学生名单粘进文本框（每行一个）。'); return; }
+  const btn = this;
+  btn.disabled = true;
+  const r = await api('/api/student/batch-create', { className: className, text: text });
+  btn.disabled = false;
+  if (!r.ok) { alert('添加失败：' + r.error); return; }
+  document.getElementById('stuAddHint').textContent = '已新增 ' + r.added + ' 名' +
+    (r.merged ? '，' + r.merged + ' 名已存在（只补了空着的学号）' : '') + ' ✓';
+  setTimeout(function () { document.getElementById('stuAddHint').textContent = ''; }, 3500);
+  document.getElementById('stuAddText').value = '';
+  await renderArchive();
+});
+
+/* 批量删除勾选的学生 */
+document.getElementById('btnStuDelBatch').addEventListener('click', async function () {
+  const ck = S.stuCk || (S.stuCk = new Set());
+  const picked = filteredStudents().filter(function (s) { return ck.has(s.id); });
+  if (!picked.length) { alert('还没有勾选任何学生。'); return; }
+  const essays = picked.reduce(function (a, s) { return a + s.records.length; }, 0);
+  const shown = picked.slice(0, 5).map(function (s) { return s.name; }).join('、') +
+    (picked.length > 5 ? ' 等' + picked.length + ' 名' : '');
+  if (!confirm('删除 ' + shown + ' ？\n\n' +
+    (essays ? '他们名下共 ' + essays + ' 篇作文（含照片与批改结果）会一并删除。' : '') +
+    '此操作不可撤销。')) return;
+  const r = await api('/api/student/delete', { ids: picked.map(function (s) { return s.id; }) });
+  if (!r.ok) { alert('删除失败：' + r.error); return; }
+  S.stuCk.clear();
+  document.getElementById('stuDetail').style.display = 'none';
+  await renderArchive();
+});
+document.getElementById('stuCkAll').addEventListener('click', function () {
+  const ck = S.stuCk || (S.stuCk = new Set());
+  filteredStudents().forEach(function (s) { ck.add(s.id); });
+  renderStudentList();
+});
+document.getElementById('stuCkNone').addEventListener('click', function () {
+  (S.stuCk || (S.stuCk = new Set())).clear();
+  renderStudentList();
+});
+
+/* 删除学生档案：连同他名下的作文（含照片与批改结果）一起删除，不可恢复 */
+async function deleteStudent(id, name, recCount) {
+  if (!confirm('删除学生「' + name + '」？\n\n' +
+    (recCount ? '他名下的 ' + recCount + ' 篇作文（含照片与批改结果）会一并删除。' : '') +
+    '此操作不可撤销。')) return;
+  const r = await api('/api/student/delete', { id: id });
+  if (!r.ok) { alert('删除失败：' + r.error); return; }
+  (S.stuCk || (S.stuCk = new Set())).delete(id);
+  await renderArchive();
+  document.getElementById('stuDetail').style.display = 'none';
+}
 
 /* 作文明细表：点行看详情 */
 document.getElementById('stuDetail').addEventListener('click', function (ev) {
@@ -2329,6 +3507,8 @@ document.getElementById('recBody').addEventListener('click', function (ev) {
 });
 
 document.getElementById('stuDetail').addEventListener('click', async function (ev) {
+  const del = ev.target.closest('#btnDelStu');
+  if (del) { deleteStudent(del.dataset.sid, del.dataset.stun, Number(del.dataset.sturc || 0)); return; }
   const btn = ev.target.closest('#btnSaveStu');
   if (!btn) return;
   const g = (id) => document.getElementById(id).value.trim();
@@ -2403,13 +3583,13 @@ function checkModel() {
   const isDS = m.indexOf('deepseek') === 0;
   const looksVision = /(vl|vision|4v|omni|gpt-4o|gemini|claude|glm-4v)/.test(m);
   if (isDS && DS_VISION_OK.indexOf(m) === -1) {
-    w.style.color = '#DC2626';
+    w.style.color = 'var(--danger)';
     w.textContent = '⚠ ' + el.value + ' 不支持图片输入。DeepSeek 请填 deepseek-flash（旧名 deepseek-v4-flash 也可用）。';
   } else if (!isDS && !looksVision) {
-    w.style.color = '#D97706';
+    w.style.color = 'var(--warn)';
     w.textContent = '提示：请确认这个模型支持图片输入（名称通常含 vl / vision / 4v）。';
   } else {
-    w.style.color = '#059669';
+    w.style.color = 'var(--ok)';
     w.textContent = '✓ 这个模型支持图片输入。';
   }
 }

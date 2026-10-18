@@ -4,7 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>点墨 · 作文批改台</title>
+<!-- 内联空图标：不引外部资源，同时挡掉浏览器对 /favicon.ico 的自动请求 -->
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/styles.css">
+<style>
+  /* 班级 chip 的删除 ✕ 与「添加班级」chip（学生档案页） */
+  .chip .clx { display: none; margin-left: 6px; color: #94a3b8; cursor: pointer; font-style: normal; font-size: 12px; padding: 1px 5px; border-radius: 6px; }
+  .chip:hover .clx { display: inline-block; }
+  .chip .clx:hover { color: #dc2626; background: rgba(220, 38, 38, .1); }
+  .chip.add { border-style: dashed; cursor: pointer; }
+</style>
 </head>
 <body>
 
@@ -60,7 +69,7 @@
       <div class="field">
         <label class="lb">拍照识别题目 <small>选填，拍试卷上的作文题即可自动填写下面几项</small></label>
         <div class="qdrop" id="qDrop">
-          <span class="ic">📷</span>
+          <span class="ic"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 7.5h3l1.2-2h4.6l1.2 2h3v8h-13z"/><circle cx="10" cy="11" r="2.5"/></svg></span>
           <div>
             <b>点击选择试卷照片</b>，或把图片拖进来、直接按 ⌘V 粘贴截图
             <small>识别结果会填进下面的题目与要点，请核对后再创建</small>
@@ -81,7 +90,7 @@
       <div class="field">
         <label class="lb">批次默认班级 <small>只当默认值，每篇以卷面识别或手填为准</small></label>
         <input type="text" id="nbClass" placeholder="如 九二班" list="clsOptions">
-        <div class="hint">一个批次里混了几个班的卷子也没关系：每篇按卷面上写的班级记，这里只是「一键填写班级」时的默认值。</div>
+        <div class="hint">一个批次里混了几个班的卷子也没关系：每篇按卷面上写的班级记，这里只是「一键填写班级」时的默认值。这里不填也行 —— 批次名旁边的班级会按这批作文卷面上识别到的班级自动显示。</div>
       </div>
       <div class="field">
         <label class="lb">词数要求 <small>选填，拍照识别会自动填入</small></label>
@@ -106,7 +115,7 @@
     <div class="card" id="uploadCard" style="display:none">
       <div class="card-h"><span class="dot">2</span>上传作文照片<span class="sub">一张照片 ＝ 一篇作文</span></div>
       <div class="drop" id="drop">
-        <div class="ic">📄</div>
+        <div class="ic"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3.5" width="14" height="13" rx="2"/><circle cx="7.5" cy="8" r="1.3"/><path d="M4 14.5l4.2-4.2 3.4 3.4 2-2 2.9 2.9"/></svg></div>
         <h4>点击选择照片，或把图片拖到这里</h4>
         <p>支持 JPG / PNG / WebP，可一次选多张，按选择顺序自动编号</p>
         <small>建议：一页一篇，正对拍摄、光线充足，识别更准</small>
@@ -124,11 +133,13 @@
 
     <div class="card" id="resultCard">
       <div class="card-h"><span class="dot">3</span>批改结果与复核<span class="sp"></span>
-        <button class="btn sm orange" id="btnRegrade" style="display:none">重批未成功的作文</button>
+        <button class="btn sm ghost" id="btnDup" title="把这一批的作文原文两两比对，找互相传抄的篇目。纯本地计算，不调用模型、不花钱。扫完结果显示在浮层里，不改动下面的列表">雷同检测</button>
         <button class="btn sm" id="btnMakeEssays">生成范文</button>
         <button class="btn sm dark" id="btnReport">导出学生报告</button>
+        <button class="btn sm orange" id="btnRegrade" style="display:none">重批未成功的作文</button>
         <span class="sub" id="resSub"></span>
       </div>
+      <div id="essayTools"></div>
       <div id="essayList"></div>
     </div>
   </section>
@@ -136,18 +147,18 @@
   <!-- ==================== 记录与统计 ==================== -->
   <section class="view" id="view-records">
     <div class="card">
-      <div class="card-h"><span class="dot">▤</span>历史批次<span class="sub">点击查看明细</span></div>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 6h12M4 10h12M4 14h8"/></svg></span>历史批次<span class="sub">点击查看明细</span></div>
       <div id="batchList"></div>
     </div>
     <div class="card" id="statCard" style="display:none">
-      <div class="card-h"><span class="dot">▦</span>本次统计<span class="sub" id="statSub"></span></div>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4.5 16V9M10 16V4.5M15.5 16v-5"/></svg></span>本次统计<span class="sub" id="statSub"></span></div>
       <div class="stats" id="stats"></div>
       <div class="dist" id="dist"></div>
       <div id="analysis"></div>
       <div id="classAi"></div>
     </div>
     <div class="card" id="rosterCard" style="display:none">
-      <div class="card-h"><span class="dot">▤</span>登分表<span class="sp"></span>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="13" height="12" rx="2"/><path d="M3.5 8h13M8.5 8v8"/></svg></span>登分表 · 成绩明细<span class="sub">点行展开四维与核心问题</span><span class="sp"></span>
         <button class="btn sm ghost" id="btnRosterList" title="贴一次本班名单，卷面上的考号/学号就能自动对到人">班级名单</button>
         <button class="btn sm ghost" id="btnScanNames" title="对还没认出姓名的篇目再跑一次卷首识别">识别姓名</button>
         <button class="btn sm" id="btnCopyRoster">复制登分表</button>
@@ -157,37 +168,53 @@
       <div class="clsbar">
         <b>一键填写班级</b>
         <input type="text" id="clsFillInput" list="clsOptions" placeholder="如 九二班">
-        <button class="btn sm" id="btnFillClassBlank">只填空白的</button>
-        <button class="btn sm ghost" id="btnFillClassAll">全部改成这个</button>
+        <button class="btn sm" id="btnFillClassSelected">填到勾选的 <span id="clsFillCount">0</span> 篇</button>
+        <a href="javascript:void(0)" id="ckBlank" style="font-size:12px">选空白</a>
+        <a href="javascript:void(0)" id="ckAll" style="font-size:12px">全选</a>
+        <a href="javascript:void(0)" id="ckNone" style="font-size:12px">全不选</a>
         <span class="hint" id="clsFillHint"></span>
       </div>
       <div class="tbl-wrap"><table id="rosterTable"></table></div>
-      <div class="note"><b>姓名、班级、考号可以直接在这张表里点一下就能改</b>，改完点别处自动保存，按回车跳到下一行继续填，一路填下来很快。<br>姓名优先取你在表里填的，其次取卷面识别到的。「正文首句」用来快速辨认是哪一篇作文。<br><b>学生手写的姓名认不准怎么办：</b>先点「班级名单」贴上本班「学号 + 姓名」，再点「识别姓名」；卷面上的考号是阿拉伯数字，比草写汉字好认得多，认到考号就能定到人。<br><b>这份表含学生姓名，仅供你内部登分使用</b>，导出文件名已标注「仅内部使用」，请勿转发或上传。</div>
-    </div>
-
-    <div class="card" id="tableCard" style="display:none">
-      <div class="card-h"><span class="dot">☰</span>成绩明细<span class="sp"></span>
+      <div class="note"><b>姓名、班级、考号可以直接在这张表里点一下就能改</b>，改完点别处自动保存，按回车跳到下一行继续填，一路填下来很快。<b>点一行可以展开这一篇的成绩明细</b>（四维分、词数、作文标题、正文首句、核心问题）。<br>姓名优先取你在表里填的，其次取卷面识别到的。「正文首句」用来快速辨认是哪一篇作文。<br><b>学生手写的姓名认不准怎么办：</b>先点「班级名单」贴上本班「学号 + 姓名」，再点「识别姓名」；卷面上的考号是阿拉伯数字，比草写汉字好认得多，认到考号就能定到人。<br><b>这份表含学生姓名，仅供你内部登分使用</b>，导出文件名已标注「仅内部使用」，请勿转发或上传。</div>
+      <div class="tip"><b>导出：</b><span class="sp"></span>
         <button class="btn sm dark" id="btnReport2">导出学生报告（Word）</button>
         <button class="btn sm ghost" id="btnExport">导出成绩表（Excel）</button>
       </div>
-      <div class="tbl-wrap"><table id="scoreTable"></table></div>
-      <div class="tip">「导出学生报告」生成 Word 文档，<b>每个学生一页</b>，含得分、要点核对、改进建议、老师评语和为该生改写的范文，可直接打印裁开发到学生手上。<b>识别到或手填了姓名的会自动印上姓名，没有的留空供手写。</b></div>
-      <div class="tip">成绩表和学生报告都会带上姓名 —— 卷面识别到的、或你在登分表里手填的。没有姓名则留空（报告上留一条空白下划线给你手写）。<b>这些文件含学生个人信息，请勿转发或上传到外部平台</b>，发给学生本人没问题。</div>
+      <div class="tip">「导出学生报告」生成 Word 文档，<b>每个学生一页</b>，含得分、要点核对、改进建议、老师评语和为该生改写的范文，可直接打印裁开发到学生手上。<b>识别到或手填了姓名的会自动印上姓名，没有的留空供手写。</b>成绩表和学生报告都含学生姓名 —— 请勿转发或上传到外部平台，发给学生本人没问题。</div>
     </div>
   </section>
 
   <!-- ==================== 学生档案 ==================== -->
   <section class="view" id="view-archive">
     <div class="card">
-      <div class="card-h"><span class="dot">▣</span>班级概览<span class="sub">跨批次归档</span></div>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3.5" y="3.5" width="5.5" height="5.5" rx="1.5"/><rect x="11" y="3.5" width="5.5" height="5.5" rx="1.5"/><rect x="3.5" y="11" width="5.5" height="5.5" rx="1.5"/><rect x="11" y="11" width="5.5" height="5.5" rx="1.5"/></svg></span>班级概览<span class="sub">跨批次归档</span></div>
       <div id="classList"></div>
       <div class="tip">学生按「班级 + 姓名」自动归档。同一个班同名同姓只会是两个学生；不同班级同名不会混在一起。班级写法有出入（如「九(8)班」和「九8班」）会被识别成同一个班。</div>
     </div>
 
     <div class="card">
-      <div class="card-h"><span class="dot">◍</span>学生名单<span class="sp"></span>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="7.5" r="3"/><path d="M4.5 16.5c.9-3 3-4.6 5.5-4.6s4.6 1.6 5.5 4.6"/></svg></span>学生名单<span class="sp"></span>
         <button class="btn sm ghost" id="btnArchiveCsv">导出成绩归档表（CSV）</button>
         <span class="sub" id="stuSub"></span>
+      </div>
+      <div class="clsbar" id="stuBatchBar">
+        <button class="btn sm ghost" id="btnStuAdd">＋ 批量添加学生</button>
+        <button class="btn sm ghost" id="btnRosterImport">从 Excel 导入花名册</button>
+        <input type="file" id="rosterFile" accept=".xlsx,.csv" style="display:none">
+        <button class="btn sm ghost" id="btnStuDelBatch" disabled>删除勾选的 <span id="stuCkCount">0</span> 名</button>
+        <a href="javascript:void(0)" id="stuCkAll" style="font-size:12px">全选</a>
+        <a href="javascript:void(0)" id="stuCkNone" style="font-size:12px">全不选</a>
+        <span class="hint" id="stuBatchHint"></span>
+      </div>
+      <div id="stuAddBox" style="display:none;margin:10px 0 14px;padding:12px 14px;border:1px dashed #cbd5e1;border-radius:10px">
+        <div class="field"><label class="lb">班级 <small>批量添加的学生都归到这个班</small></label>
+          <input type="text" id="stuAddClass" list="clsOptions" placeholder="如 九二班"></div>
+        <div class="field" style="margin-top:10px"><label class="lb">学生名单 <small>每行一个，支持「24 李小明」「李小明 24」「李小明」</small></label>
+          <textarea id="stuAddText" style="min-height:120px;font-family:var(--mono);font-size:13px" placeholder="1 王小一&#10;2 李小二&#10;3 张小三"></textarea></div>
+        <div class="btn-row"><button class="btn sm" id="btnStuAddGo">添加到档案</button>
+          <button class="btn sm ghost" id="btnStuAddCancel">收起</button>
+          <span class="hint" id="stuAddHint"></span></div>
+        <div class="hint">还没有作文的学生也能先建档（比如开学初把全班名单录进来）；之后批改到他们的作文，会按「班级＋姓名」自动并入。已存在的同名同班学生只补空着的学号，不会重复建档。</div>
       </div>
       <div id="stuList"></div>
       <div class="note" id="unnamedNote" style="display:none"></div>
@@ -199,7 +226,7 @@
   <!-- ==================== 设置 ==================== -->
   <section class="view" id="view-settings">
     <div class="card">
-      <div class="card-h"><span class="dot">⚙</span>AI 接口配置<span class="sub">Key 只存在本机 data/settings.json</span></div>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="2.6"/><path d="M10 3.5v2M10 14.5v2M3.5 10h2M14.5 10h2M5.6 5.6l1.4 1.4M13 13l1.4 1.4M14.4 5.6L13 7M7 13l-1.4 1.4"/></svg></span>AI 接口配置<span class="sub">Key 只存在本机 data/settings.json</span></div>
       <div class="field">
         <label class="lb">服务商预设 <small>选一个自动填地址与模型名，之后可手动改</small></label>
         <select id="presetSel"></select>
@@ -245,13 +272,13 @@
       <div class="btn-row">
         <button class="btn" id="btnSaveSettings">保存配置</button>
         <button class="btn ghost" id="btnTestApi">测试连接</button>
-        <button class="btn ghost" id="btnClearKey">清除已保存的 Key</button>
+        <button class="btn danger" id="btnClearKey">清除已保存的 Key</button>
         <span class="hint" id="saveHint"></span>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-h"><span class="dot o">✦</span>阅卷提示词<span class="sub">内置 25 分制完整评分标准</span></div>
+      <div class="card-h"><span class="dot o"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.6 4.4l3 3L8.2 14.8H5.2v-3z"/><path d="M11.2 5.8l3 3"/></svg></span>阅卷提示词<span class="sub">内置 25 分制完整评分标准</span></div>
       <textarea id="promptBox" style="min-height:300px;font-size:13px;font-family:var(--mono);line-height:1.75"></textarea>
       <div class="btn-row" style="margin-top:14px">
         <button class="btn" id="btnSavePrompt">保存提示词</button>
@@ -262,7 +289,7 @@
     </div>
 
     <div class="card">
-      <div class="card-h"><span class="dot">◈</span>数据与隐私</div>
+      <div class="card-h"><span class="dot"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.4l5.5 2.1v4.1c0 3-2.2 5.4-5.5 6.4-3.3-1-5.5-3.4-5.5-6.4V5.5z"/></svg></span>数据与隐私</div>
       <ul class="blk" style="list-style:none">
         <li style="padding:6px 0">· 作文照片保存在本机 <code>data/uploads/</code>，批改记录保存在 <code>data/db.json</code>。</li>
         <li style="padding:6px 0">· API Key 保存在本机 <code>data/settings.json</code>，不会写入其他任何地方。</li>
@@ -293,6 +320,19 @@
     <div class="bar">
       <span id="recCap"></span>
       <button class="btn sm ghost" id="recClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 雷同检测浮层：结果全放这里，主流程的作文列表不再被顶开 -->
+<div class="ovl" id="dupModal">
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="dupTitle">
+    <div class="dupwrap" id="dupBody"></div>
+    <div class="bar">
+      <span class="dupmeta" id="dupCap"></span>
+      <span class="sp"></span>
+      <button class="btn sm ghost" id="dupRescan">重新扫描</button>
+      <button class="btn sm ghost" id="dupClose">关闭</button>
     </div>
   </div>
 </div>
