@@ -842,13 +842,6 @@ async function ensureLinked() {
 
 const ROSTERS_FILE = path.join(DATA_DIR, 'rosters.json');
 
-/* 班级的宽松归一：九(2)班 / 九2班 / 92 / 九二班 都算同一个班 */
-const CN_DIGIT = { '一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9', '零': '0' };
-function classKey(s) {
-  return normKey(s)
-    .replace(/[一二三四五六七八九零]/g, function (c) { return CN_DIGIT[c]; })
-    .replace(/[班别]/g, '');
-}
 
 async function loadRosters() {
   /* 与 db / students 一样严格读取：文件损坏时从快照恢复并留档坏文件，
@@ -920,9 +913,9 @@ function parseRosterText(text) {
 function digitsOf(v) { return String(v === undefined || v === null ? '' : v).replace(/[^\d]/g, ''); }
 
 function rosterOf(store, className) {
-  const k = classKey(className);
+  const k = normKey(className);
   if (!k) return null;
-  return store.classes.find(function (c) { return classKey(c.className) === k; }) || null;
+  return store.classes.find(function (c) { return normKey(c.className) === k; }) || null;
 }
 
 /* 两个姓名的相似度：最长公共子序列 ÷ 较长名字长度。
@@ -1036,9 +1029,9 @@ function reconcileWithRoster(store, className, read, archiveStudents) {
 
   // 学生档案里同班的学生也参与推荐：没有班级名单时，档案是唯一可参照的已知信息
   if (name && Array.isArray(archiveStudents)) {
-    const ak = classKey(res.className || className);
+    const ak = normKey(res.className || className);
     archiveStudents
-      .filter(function (s) { return s.name && ak && classKey(s.className) === ak; })
+      .filter(function (s) { return s.name && ak && normKey(s.className) === ak; })
       .map(function (s) { return { s: s, sc: nameSimilarity(s.name, name) }; })
       .filter(function (x) { return x.sc >= 0.32; })
       .sort(function (a, b) { return b.sc - a.sc; })
@@ -1112,7 +1105,7 @@ async function readEssayIdentity(settings, batch, essay) {
     const rc = rosterOf(rstore, clsName);
     if (rc) rc.students.forEach(function (s) { addName(s.name, s.seatNo); });
     sstore.students.forEach(function (s) {
-      if (classKey(s.className) === classKey(clsName)) addName(s.name, s.seatNo);
+      if (normKey(s.className) === normKey(clsName)) addName(s.name, s.seatNo);
     });
   }
   let userText = '请识别图片上学生自己写的身份信息（姓名 / 班级 / 考号），只返回 JSON。';
@@ -3190,8 +3183,8 @@ async function handleApi(req, res, pathname, query) {
     return await withData(async function () {
       const store = await loadRosters();
       const students = parseRosterText(body.text);
-      const key = classKey(className);
-      const rest = store.classes.filter(function (c) { return classKey(c.className) !== key; });
+      const key = normKey(className);
+      const rest = store.classes.filter(function (c) { return normKey(c.className) !== key; });
       // 空文本 = 清空名单但保留班级（要删班走「删除班级」，那会连学生档案一起处理）
       rest.push({ className: className, students: students, updatedAt: new Date().toISOString() });
       const next = { classes: rest };
@@ -3210,8 +3203,8 @@ async function handleApi(req, res, pathname, query) {
       const className = String(body.className || '').trim();
       if (!className) return sendJson(res, 200, { ok: false, error: '请先填写班级名称' });
       const store = await loadRosters();
-      const k = classKey(className);
-      if (store.classes.some(function (c) { return classKey(c.className) === k; })) {
+      const k = normKey(className);
+      if (store.classes.some(function (c) { return normKey(c.className) === k; })) {
         return sendJson(res, 200, { ok: true, existed: true });
       }
       store.classes.push({ className: className, students: [], updatedAt: new Date().toISOString() });
@@ -3224,10 +3217,10 @@ async function handleApi(req, res, pathname, query) {
     return await withData(async function () {
       const className = String(body.className || '').trim();
       if (!className) return sendJson(res, 200, { ok: false, error: '请先指定班级' });
-      const k = classKey(className);
+      const k = normKey(className);
       const store = await loadRosters();
       const students = await loadStudents();
-      const targets = students.students.filter(function (s) { return classKey(s.className) === k; });
+      const targets = students.students.filter(function (s) { return normKey(s.className) === k; });
       if (Number(body.expectedStudents) !== targets.length) {
         return sendJson(res, 200, {
           ok: false,
@@ -3247,7 +3240,7 @@ async function handleApi(req, res, pathname, query) {
       const involvedKeys = new Set();
       for (const b of db.batches) {
         // 这个班可能是批次的「默认班级」：默认归入它的、还没识别出自有班级的作文也算这个班的
-        const batchIsHis = classKey(b.className) === k;
+        const batchIsHis = normKey(b.className) === k;
         const keep = [];
         for (const e of b.essays) {
           const idt = e.identity || {};
@@ -3255,7 +3248,7 @@ async function handleApi(req, res, pathname, query) {
           const ek = idt.name ? studentKey(idt.className, idt.name) : '';
           const isHis = (e.studentId && ids.has(String(e.studentId))) ||              // 档案关联
             (ek && keys.has(ek)) ||                                                    // 姓名＋班级对得上
-            classKey(ownCls) === k ||                                                  // 卷面上写的就是这个班
+            normKey(ownCls) === k ||                                                  // 卷面上写的就是这个班
             (batchIsHis && !ownCls);                                                   // 没写班级、按批次默认归入
           if (isHis) {
             if (e.studentId) involvedIds.add(String(e.studentId));
@@ -3292,7 +3285,7 @@ async function handleApi(req, res, pathname, query) {
         cleanedArchives++;
         return false;
       });
-      store.classes = store.classes.filter(function (c) { return classKey(c.className) !== k; });
+      store.classes = store.classes.filter(function (c) { return normKey(c.className) !== k; });
       await writeJson(DB_FILE, db);
       await writeJson(STUDENTS_FILE, students);
       await writeJson(ROSTERS_FILE, store);
@@ -3355,7 +3348,7 @@ async function handleApi(req, res, pathname, query) {
       groups.forEach(function (g) {
         const className = String(g.className || '').trim();
         if (!className) return;
-        const k = classKey(className);
+        const k = normKey(className);
         if (!byCls[k]) { byCls[k] = { className: className, seen: {}, students: [] }; order.push(k); }
         (Array.isArray(g.students) ? g.students : []).forEach(function (s) {
           const name = String(s.name || '').trim().replace(/[()（）]/g, '');
@@ -3379,8 +3372,8 @@ async function handleApi(req, res, pathname, query) {
           return className && /^[\u4e00-\u9fa5·]{2,4}$/.test(s.name) && !NOT_A_NAME.test(s.name);
         });
         if (!items.length) continue;
-        const k = classKey(className);
-        store.classes = store.classes.filter(function (c) { return classKey(c.className) !== k; });
+        const k = normKey(className);
+        store.classes = store.classes.filter(function (c) { return normKey(c.className) !== k; });
         store.classes.push({ className: className, students: items, updatedAt: now });
         for (const it of items) {
           const key = studentKey(className, it.name);
