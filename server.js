@@ -2798,41 +2798,49 @@ async function handleApi(req, res, pathname, query) {
     });
   }
 
-  /* ---- 删除学生档案：作文与成绩保留，但解除关联并清掉这些作文上的姓名 ----
-     （登分表里变回空白，可重新填写或识别）。不跑 rebuildStudents ——
-     残留姓名会被它重新建档，删除就白删了。
-     支持批量：传 ids 数组一次删多个；传单个 id 也照旧可用。 */
+  /* ---- 删除学生档案：连同名下作文一起删除（含照片与批改结果），不可恢复 ----
+     之所以连作文删：只删档案清姓名的老做法会被 /api/backfill 用卷面残留的
+     考号 + 班级名单把姓名「恢复」回来并重建档案（删除看起来不生效）；
+     作文删掉后没有任何残留可复活。命中范围：studentId 关联的作文，
+     外加「姓名＋班级能对上」但还没归档的散篇。支持 ids 数组批量删。 */
   if (pathname === '/api/student/delete') {
     return await withData(async function () {
       const store = await loadStudents();
       const ids = (Array.isArray(body.ids) ? body.ids : [body.id]).map(String).filter(Boolean);
       if (!ids.length) return sendJson(res, 200, { ok: false, error: '没有指定要删除的学生' });
       const set = new Set(ids);
-      const db = await loadDb();
-      let unlinked = 0, deleted = 0;
-      const names = [];
-      db.batches.forEach(function (b) {
-        b.essays.forEach(function (e) {
-          if (!e.studentId || !set.has(String(e.studentId))) return;
-          e.studentId = '';
-          e.nameCandidates = [];
-          const idt = e.identity || {};
-          if (String(idt.name || '').trim()) {
-            e.identity = Object.assign({}, idt, { name: '', updatedAt: new Date().toISOString() });
-          }
-          unlinked++;
-        });
+      const keys = new Set();
+      store.students.forEach(function (s) {
+        if (!set.has(s.id)) return;
+        const k = studentKey(s.className, s.name);
+        if (k) keys.add(k);
       });
-      store.students = store.students.filter(function (x) {
-        if (!set.has(x.id)) return true;
-        names.push(x.name);
-        deleted++;
-        return false;
+      const db = await loadDb();
+      let deleted = 0, removedEssays = 0, cleanupFailed = 0;
+      const names = [];
+      store.students.forEach(function (s) {
+        if (set.has(s.id)) { names.push(s.name); deleted++; }
       });
       if (!deleted) return sendJson(res, 404, { ok: false, error: '学生档案不存在' });
+      for (const b of db.batches) {
+        const keep = [];
+        for (const e of b.essays) {
+          const idt = e.identity || {};
+          const k = idt.name ? studentKey(idt.className, idt.name) : '';
+          const isHis = (e.studentId && set.has(String(e.studentId))) || (k && keys.has(k));
+          if (!isHis) { keep.push(e); continue; }
+          removedEssays++;
+          cleanupFailed += await removeFiles([e]);
+        }
+        b.essays = keep;
+      }
+      store.students = store.students.filter(function (x) { return !set.has(x.id); });
       await writeJson(DB_FILE, db);
       await writeJson(STUDENTS_FILE, store);
-      return sendJson(res, 200, { ok: true, deleted: deleted, unlinked: unlinked, names: names });
+      return sendJson(res, 200, {
+        ok: true, deleted: deleted, removedEssays: removedEssays,
+        cleanupFailed: cleanupFailed, names: names
+      });
     });
   }
 
