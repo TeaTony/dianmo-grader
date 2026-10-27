@@ -1,0 +1,15 @@
+Dianmo Essay Grader - Windows x64
+
+1. Extract the whole ZIP file first.
+   Do not run it directly inside the ZIP viewer.
+
+2. Double-click START-WINDOWS.bat.
+   Keep the black window open while using Dianmo.
+
+3. The browser should open:
+   http://127.0.0.1:8787
+
+If startup fails, send startup-log.txt together with a screenshot
+of the black window.
+
+This package does not include student records, photos, or API keys.

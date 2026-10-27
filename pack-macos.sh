@@ -14,12 +14,12 @@
 #   · ad-hoc 签名（本机构建本机运行没问题；分发给他人的机器上首次打开
 #     需要「右键 → 打开」绕过 Gatekeeper 的未认证提示）
 #
-# 用法：./pack-macos.sh [版本号]     （缺省 1.3.0）
+# 用法：./pack-macos.sh [版本号]     （缺省 1.4.2）
 # ---------------------------------------------------------------------------
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-1.3.0}"
+VERSION="${1:-1.4.2}"
 APP_NAME="点墨"
 DATA_DIR_NAME="点墨数据"
 NODE_BIN="$(command -v node)"

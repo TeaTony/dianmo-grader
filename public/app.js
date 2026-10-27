@@ -223,7 +223,7 @@ function compress(file, maxSide, quality) {
 
 /* 卷首放大图：把「卷首横条 + 左右两条竖边」裁出来放大拼成一张图，随照片一起上传。
 
-   为什么要多这一张：手写的「九(2) 李小明 24」常常只有小指甲盖大小，
+   为什么要多这一张：手写的「九(2) 同学A 24」常常只有小指甲盖大小，
    整页照片（三四千像素）送进模型会被压到一千多，那行小字就糊成一团认不出了。
    模型自己没法「局部放大」，只能我们先把卷首裁出来再送进去 —— 同一趟请求，
    字大了一倍多，手写姓名和考号就认得出来了。
@@ -2722,8 +2722,8 @@ document.getElementById('rosterTable').addEventListener('click', function (ev) {
 });
 
 /* ---- 班级名单：贴一次名单，之后所有批次的考号都能对上人 ----
-   手写的「李小明」可能连笔成谁都认不出，但旁边那个「24」是阿拉伯数字，好认得多。
-   有班级名单，就能「认到 24 号 → 名单里 24 号是李小明」把姓名定下来。 */
+   手写的「同学A」可能连笔成谁都认不出，但旁边那个「24」是阿拉伯数字，好认得多。
+   有班级名单，就能「认到 24 号 → 名单里 24 号是同学A」把姓名定下来。 */
 async function openRosterEditor() {
   const cls = (S.current && S.current.className) || (S.recordData && S.recordData.className) || '';
   const r = await api('/api/class/list' + (cls ? '?className=' + encodeURIComponent(cls) : ''));
@@ -2733,8 +2733,8 @@ async function openRosterEditor() {
   body.innerHTML =
     '<h5 style="margin:0 0 4px">班级名单　<span style="font-weight:400;color:var(--ink3);font-size:13px">贴一次，之后每次批改都能用</span></h5>' +
     '<div class="hint" style="font-size:13px;line-height:1.8">' +
-      '一行一个人，<b>考号 / 学号 + 姓名</b>即可：「24 李小明」「24,李小明」「李小明 24」。<br>' +
-      '直接从成绩表里复制整行也行（如 <span class="mono">| 12 | 24 | 李小明 | 334.0 |</span>），多余的列会被忽略。<br>' +
+      '一行一个人，<b>考号 / 学号 + 姓名</b>即可：「24 同学A」「24,同学A」「同学A 24」。<br>' +
+      '直接从成绩表里复制整行也行（如 <span class="mono">| 12 | 24 | 同学A | 334.0 |</span>），多余的列会被忽略。<br>' +
       '作用：卷面上手写的姓名认不准时，用<b>考号</b>把它对到名单里的姓名上 —— 数字比草字可靠得多。' +
     '</div>' +
     '<div class="row" style="margin:10px 0 6px">' +
@@ -2742,7 +2742,7 @@ async function openRosterEditor() {
         '<input type="text" id="rostCls" value="' + esc(cls) + '" placeholder="如 九二班"></div>' +
     '</div>' +
     '<label class="lb">名单（每行一人）</label>' +
-    '<textarea id="rostText" style="min-height:260px;font-size:13px;line-height:1.8" placeholder="24 李小明&#10;3 王小华&#10;35 李小华"></textarea>' +
+    '<textarea id="rostText" style="min-height:260px;font-size:13px;line-height:1.8" placeholder="24 同学A&#10;3 同学B&#10;35 同学C"></textarea>' +
     '<div class="btn-row" style="margin-top:12px">' +
       '<button class="btn orange" id="rostSave">保存名单</button>' +
       '<button class="btn ghost" id="rostClose">关闭</button>' +

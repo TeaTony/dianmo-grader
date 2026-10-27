@@ -10,7 +10,7 @@ const http = require('http');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -313,7 +313,7 @@ const QUESTION_PROMPT = `你是协助初三英语教师录入备课资料的助�
 const IDENTITY_PROMPT = `你要从一张初三英语作文卷面的照片里，抄录学生自己写在卷面上的身份信息：姓名、班级、考号 / 学号 / 座号。这些信息供教师在登分表里核对，抄错会把成绩记到别的学生头上，必须谨慎。
 
 【优先看哪里】
-- 最先看「左上四分之一」：整张答题卡扫描件时，学生信息栏（姓名 / 班级 / 考号填涂）通常就在左上四分之一，例如「九(2) 李小明 24」「九（8）班 李四 35」。姓名通常夹在班级和数字之间，或紧跟在数字前面。
+- 最先看「左上四分之一」：整张答题卡扫描件时，学生信息栏（姓名 / 班级 / 考号填涂）通常就在左上四分之一，例如「九(2) 同学A 24」「九（8）班 同学B 35」。姓名通常夹在班级和数字之间，或紧跟在数字前面。
 - 其次是卷首左上角或右上角，紧挨着作文标题上方或标题同一行。
 - 再次是左侧装订线、右侧页边、页脚：整行旋转 90° 竖排的小字，常标注「班级 / 姓名 / 考场 / 座次 / 座位号」。遇到旋转的文字，先在脑子里转正再读。
 - 四条边都扫一遍。这一趟只找身份信息，不要去读作文正文（正文里出现的 Li Hua 之类的名字不是学生信息）。
@@ -405,7 +405,7 @@ const ROSTER_IMPORT_PROMPT = `你是协助初三英语教师整理学生花名�
 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块包裹。字段如下：
 {
   "groups": [
-    { "className": "九(2)", "students": [ { "seatNo": "24", "name": "李小明" } ] }
+    { "className": "九(2)", "students": [ { "seatNo": "24", "name": "同学A" } ] }
   ]
 }`;
 
@@ -615,13 +615,13 @@ function studentKey(className, name) {
   return normKey(className) + '|' + n;
 }
 
-/* 从上传文件名里取姓名：老师一般把答题卡按「编号_姓名.jpg」命名（如 01_李小明.jpg）。
+/* 从上传文件名里取姓名：老师一般把答题卡按「编号_姓名.jpg」命名（如 01_同学A.jpg）。
    这是教师自己排好的名单，比让模型去认卷面上旋转的小字可靠，所以拿它当姓名的兜底。
    只认「文件名结尾是 2–4 个汉字」的情况，其它命名（IMG_1234.jpg、扫描件001.jpg）一律忽略。 */
 const NOT_A_NAME = /答题卡|扫描|扫描件|试卷|作文|原卷|原件|副本|学生|练习|模拟|英语|答案/;
 function nameFromFileName(name) {
   const base = String(name || '').replace(/\.[A-Za-z0-9]+$/, '').trim();
-  // 前缀只允许「字母数字 + 分隔符」或什么都不写，避免把「李小明」这种纯姓名截成「小明」
+  // 前缀只允许「字母数字 + 分隔符」或什么都不写，避免把「同学A」这种纯姓名截成「小明」
   const m = base.match(/^(?:[0-9A-Za-z]+[_\-\s]*)?([\u4e00-\u9fa5]{2,4})$/);
   if (!m) return '';
   const cand = m[1];
@@ -860,8 +860,8 @@ async function loadRosters() {
 }
 
 /* 把教师粘贴的名单解析成 [{ seatNo, name }]。容错各种贴法：
-     「24 李小明」「李小明 24」「24,李小明」「李小明」
-     「| 12 | 24 | 李小明 | 334.0 | 89.0 |」（直接从成绩表里复制一整行）
+     「24 同学A」「同学A 24」「24,同学A」「同学A」
+     「| 12 | 24 | 同学A | 334.0 | 89.0 |」（直接从成绩表里复制一整行）
    规则：行里最后一个 2–4 字的汉字段当姓名，离它最近的那个数字当考号 / 学号。 */
 function parseRosterText(text) {
   const out = [];
@@ -892,7 +892,7 @@ function parseRosterText(text) {
     const name = tokens[nameIdx];
     let seat = '', fallback = '';
     for (let d = 1; d <= 2 && !seat; d++) {
-      // 同一个距离上先看右边再看左边：「李小明 24」和「24 李小明」两种写法都要认；
+      // 同一个距离上先看右边再看左边：「同学A 24」和「24 同学A」两种写法都要认；
       // 成绩表里右边常跟着分数（334.0 或 > 60），会被 plausible 挡掉，于是落到左边的 24。
       [tokens[nameIdx + d], tokens[nameIdx - d]].forEach(function (tk) {
         const p = asSeat(tk);
@@ -902,7 +902,7 @@ function parseRosterText(text) {
       });
     }
     if (!seat) seat = fallback;
-    // 同一个人被贴了两遍只留一条；带考号的那条优先（「李小明 24」比光一个姓名有用）
+    // 同一个人被贴了两遍只留一条；带考号的那条优先（「同学A 24」比光一个姓名有用）
     const exist = byName[name];
     if (exist) {
       if (!exist.seatNo && seat) exist.seatNo = seat;
@@ -924,7 +924,7 @@ function rosterOf(store, className) {
 }
 
 /* 两个姓名的相似度：最长公共子序列 ÷ 较长名字长度。
-   「李小明 / 李小华」这类只错一两个字的，得分落在 0.3–0.7 之间，正好用来排序候选。 */
+   「同学A / 同学C」这类只错一两个字的，得分落在 0.3–0.7 之间，正好用来排序候选。 */
 function nameSimilarity(a, b) {
   a = String(a || '').trim();
   b = String(b || '').trim();
@@ -3301,7 +3301,7 @@ async function handleApi(req, res, pathname, query) {
   }
 
   /* ---- 批量建立学生档案：还没批改到作文的学生先建档（如开学初录全班名单） ----
-     文本格式与班级名单一致：每行一个，支持「24 李小明」「李小明 24」「李小明」。
+     文本格式与班级名单一致：每行一个，支持「24 同学A」「同学A 24」「同学A」。
      manual 标记让这些零作文档案不会被 rebuildStudents 当残留清掉；
      之后批改到他们的作文时，按「班级＋姓名」自动并入同一条档案。
      已存在的同名同班学生只补空着的学号，不重复建档。 */
@@ -4110,7 +4110,18 @@ async function handleApi(req, res, pathname, query) {
 function openBrowser(url) {
   let cmd = '';
   if (process.platform === 'darwin') cmd = 'open "' + url + '"';
-  else if (process.platform === 'win32') cmd = 'cmd /c start "" "' + url + '"';
+  else if (process.platform === 'win32') {
+    /* 直接交给 cmd start。原先用 exec 再套一层 cmd /c，Windows 下引号常被
+       重复解释，命令静默失败，表现为服务已启动但浏览器不弹。 */
+    const child = spawn('cmd.exe', ['/d', '/s', '/c', 'start', '', url], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    child.on('error', function () { /* 打不开也不影响，手动访问即可 */ });
+    child.unref();
+    return;
+  }
   else cmd = 'xdg-open "' + url + '"';
   exec(cmd, function () { /* 打不开也不影响，手动访问即可 */ });
 }
