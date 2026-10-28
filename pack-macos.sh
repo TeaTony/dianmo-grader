@@ -41,6 +41,22 @@ for f in README.md CHANGELOG.md LICENSE; do
   [ -f "$f" ] && cp "$f" "$CONTENT/Resources/app/"
 done
 
+echo "①b 拷贝作文评分 skill（默认提示词的来源，server.js 启动时从这里加载）"
+SKILL_SRC="${DIANMO_SKILL_SRC:-$HOME/.codex/skills/suzhou-english-essay-25-rubric}"
+if [ -d "$SKILL_SRC" ]; then
+  # 只装进 App 内置数据目录 data/rubric-skill/（server.js 的第 2 候选路径），
+  # 排除 agents/scripts 等运行用不到的目录
+  mkdir -p "$CONTENT/Resources/app/data/rubric-skill"
+  for item in SKILL.md README.md LICENSE rubric.json references; do
+    [ -e "$SKILL_SRC/$item" ] && cp -R "$SKILL_SRC/$item" "$CONTENT/Resources/app/data/rubric-skill/"
+  done
+  find "$CONTENT/Resources/app/data/rubric-skill" -name ".DS_Store" -delete 2>/dev/null || true
+else
+  echo "  ✗ 未找到 skill：$SKILL_SRC —— 打出的包启动会报「未找到作文评分 skill」。"
+  echo "    可用 DIANMO_SKILL_SRC=路径 指定 skill 目录后重新打包。"
+  exit 1
+fi
+
 echo "② 拷贝 Node 运行时（$("$NODE_BIN" --version)）"
 NODE_REAL="$(realpath "$NODE_BIN")"
 cp "$NODE_REAL" "$CONTENT/MacOS/node"
